@@ -20,8 +20,6 @@ newtype ContextMap a = ContextMap (M.HashMap Context (M.HashMap Token a))
 -- newtype ContextMap a = ContextMap (M.HashMap Context a)
 -- newtype TokenMap a = TokenMap (M.HashMap Token a)
 
-newtype StandardMap = StandardMap (M.HashMap Context Standard) deriving (Show)
-
 newtype EntropyMap = EntropyMap (M.HashMap Context Entropy) deriving (Show)
 
 newtype InfoContentMap = InfoContentMap (ContextMap InfoContent)
@@ -141,13 +139,6 @@ entropyMap (MarkovChain (ContextMap mc)) =
   where
     asEntropy = entropy . M.elems
 
---standardMap :: EntropyMap -> StandardMap
---standardMap (EntropyMap em) = StandardMap $ M.map standard em
---  where
---    mean = sum (M.elems em) / fromIntegral (length em)
---    sdev = undefined
---    standard entropy = (entropy - mean) / sdev
-
 infoContentMap :: MarkovChain -> InfoContentMap
 infoContentMap (MarkovChain (ContextMap mc)) =
   InfoContentMap $
@@ -178,8 +169,8 @@ entropyBoundary (BoundaryPolicy bp) (EntropyMap em) (cxtA, cxtB) =
     entropyB <- M.lookup cxtB em
     pure $ entropyA `bp` entropyB
 
-icBoundary :: BoundaryPolicy -> InfoContentMap -> (Token, Token) -> (Context, Context) -> Boundary
-icBoundary (BoundaryPolicy bp) (InfoContentMap (ContextMap im)) (tknA, tknB) (cxtA, cxtB) =
+icBoundary :: BoundaryPolicy -> InfoContentMap -> ((Token, Context), (Token, Context)) -> Boundary
+icBoundary (BoundaryPolicy bp) (InfoContentMap (ContextMap im)) ((tknA, cxtA), (tknB, cxtB)) =
   fromMaybe NoBoundary $ do
     imA <- M.lookup cxtA im
     icA <- M.lookup tknA imA
@@ -192,6 +183,11 @@ unionBoundary NoBoundary NoBoundary = NoBoundary
 unionBoundary _ Boundary = Boundary
 unionBoundary Boundary _ = Boundary
 
+intersectionBoundary :: Boundary -> Boundary -> Boundary
+intersectionBoundary Boundary Boundary = Boundary
+intersectionBoundary _ NoBoundary = NoBoundary
+intersectionBoundary NoBoundary _ = NoBoundary
+
 -- (target, (suffix_a, suffix_b), (prefix_a, prefix_b))
 -- TODO: Handle edges of token list
 contexts :: Order -> [Token] -> [(Token, (Context, Context), (Context, Context))]
@@ -202,6 +198,9 @@ contextPairs k (t : ts) = zip (map window2context (windows k (t : ts))) (map win
 
 window2context :: Window -> Context
 window2context (Window w) = Context w
+
+context2window :: Context -> Window
+context2window (Context c) = Window c
 
 -- TODO: Handle edges of token list
 entropyFold :: Order -> BoundaryPolicy -> (EntropyMap, EntropyMap) -> [Token] -> [Segment]
@@ -216,38 +215,73 @@ entropyFold (Order k) bp (pm, sm) ts = snd $ foldr f initial (contexts (Order k)
         isPrefixBoundary = entropyBoundary bp pm prefixCxts
         isSuffixBoundary = entropyBoundary bp sm suffixCxts
 
+-- TODO: Handle edges of token list
+icFold :: Order -> BoundaryPolicy -> (InfoContentMap, InfoContentMap) -> [Token] -> [Segment]
+icFold (Order k) bp (pm, sm) ts = snd $ foldr f initial (contexts (Order (k+1)) ts)
+  where
+    initial = (Segment [], [])
+    f (t', suffixWs, prefixWs) (Segment s, segments) = case isBoundary of
+      Boundary -> (Segment [t'], Segment s : segments)
+      NoBoundary -> (Segment (t' : s), segments)
+      where
+        (pa, pb) = prefixWs
+        (sa, sb) = suffixWs
+        prefixTknCxts = (prefixSplit (context2window pa), prefixSplit (context2window pb))
+        suffixTknCxts = (suffixSplit (context2window sa), suffixSplit (context2window sb))
+        isPrefixBoundary = icBoundary bp pm prefixTknCxts
+        isSuffixBoundary = icBoundary bp sm suffixTknCxts
+        isBoundary = unionBoundary isPrefixBoundary isSuffixBoundary
+
 segmentByBoundaryEntropy :: Order -> [Token] -> [Segment]
-segmentByBoundaryEntropy k ts =
-  entropyFold k rise (pm ts, sm ts) ts
+segmentByBoundaryEntropy k ts = entropyFold k rise (pm ts, sm ts) ts
   where
     pm = entropyMap . markovChain . prefixTransitionMap k
     sm = entropyMap . markovChain . suffixTransitionMap k
 
-nestedBES :: Count -> Order -> [Token] -> [Token]
-nestedBES i k ts
+segmentByBoundaryIC :: Order -> [Token] -> [Segment]
+segmentByBoundaryIC k ts = icFold k rise (pm ts, sm ts) ts
+  where
+    pm = infoContentMap . markovChain . prefixTransitionMap k
+    sm = infoContentMap . markovChain . suffixTransitionMap k
+
+nestedEntropy :: Count -> Order -> [Token] -> [Token]
+nestedEntropy i k ts
   | i < 1 = ts
-  | otherwise = nestedBES (i - 1) k $ map tokenize $ segmentByBoundaryEntropy k ts
+  | otherwise = nestedEntropy (i - 1) k $ map tokenize $ segmentByBoundaryEntropy k ts
+
+nestedInfoContent :: Count -> Order -> [Token] -> [Token]
+nestedInfoContent i k ts
+  | i < 1 = ts
+  | otherwise = nestedInfoContent (i - 1) k $ map tokenize $ segmentByBoundaryIC k ts
 
 --------------------------------------------------------------------------------
 -- Input
 
-nestedBesText :: Integer -> Int -> String -> IO ()
-nestedBesText depth k fileName = do
+nestedEntropyText :: Integer -> Int -> String -> IO ()
+nestedEntropyText depth k fileName = do
   text <- readFile fileName
   let contents = preprocessText text
-      segments = nestedBES depth (Order k) contents
+      segments = nestedEntropy depth (Order k) contents
+  print $ (take 500 . drop 10000) segments
+  return ()
+
+nestedInfoContentText :: Integer -> Int -> String -> IO ()
+nestedInfoContentText depth k fileName = do
+  text <- readFile fileName
+  let contents = preprocessText text
+      segments = nestedInfoContent depth (Order k) contents
   print $ (take 500 . drop 10000) segments
   return ()
 
 segmentTextWithOrder :: Int -> String -> IO ()
-segmentTextWithOrder = nestedBesText 1
+segmentTextWithOrder = nestedEntropyText 1
 
 tokenChar :: Char -> Token
 tokenChar c = Token [c]
 
 preprocessText :: String -> [Token]
 preprocessText =
-  map (tokenChar . replaceDigit . toLower) . filter isAlphaNum . filter isAscii
+  map (tokenChar . toLower) . filter isAlpha . filter isAscii
 
 replaceDigit :: Char -> Char
 replaceDigit x
