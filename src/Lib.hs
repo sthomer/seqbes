@@ -94,7 +94,7 @@ tokenize :: Segment -> Token
 tokenize (Segment ts) = Token $ concatMap (\(Token t) -> t) ts
 
 tokenizeString :: String -> [Token]
-tokenizeString = map(\ c -> Token [c])
+tokenizeString = map (\c -> Token [c])
 
 windows :: Order -> [Token] -> [Window]
 windows (Order n) ts =
@@ -141,12 +141,12 @@ entropyMap (MarkovChain (ContextMap mc)) =
   where
     asEntropy = entropy . M.elems
 
-standardMap :: EntropyMap -> StandardMap
-standardMap (EntropyMap em) = StandardMap $ M.map standard em
-  where
-    mean = sum (M.elems em) / fromIntegral (length em)
-    sdev = undefined
-    standard entropy = (entropy - mean) / sdev
+--standardMap :: EntropyMap -> StandardMap
+--standardMap (EntropyMap em) = StandardMap $ M.map standard em
+--  where
+--    mean = sum (M.elems em) / fromIntegral (length em)
+--    sdev = undefined
+--    standard entropy = (entropy - mean) / sdev
 
 infoContentMap :: MarkovChain -> InfoContentMap
 infoContentMap (MarkovChain (ContextMap mc)) =
@@ -158,6 +158,7 @@ infoContentMap (MarkovChain (ContextMap mc)) =
 
 infoContent :: Probability -> InfoContent
 infoContent p
+  | p == 0 = 0
   | p == 1 = 0
   | otherwise = (negate . logBase 2) p
 
@@ -170,15 +171,15 @@ entropy = sum . map (\p -> p * infoContent p)
 rise :: BoundaryPolicy
 rise = BoundaryPolicy (\x y -> if x < y then Boundary else NoBoundary)
 
-boundary :: BoundaryPolicy -> EntropyMap -> (Context, Context) -> Boundary
-boundary (BoundaryPolicy bp) (EntropyMap em) (cxtA, cxtB) =
+entropyBoundary :: BoundaryPolicy -> EntropyMap -> (Context, Context) -> Boundary
+entropyBoundary (BoundaryPolicy bp) (EntropyMap em) (cxtA, cxtB) =
   fromMaybe NoBoundary $ do
     entropyA <- M.lookup cxtA em
     entropyB <- M.lookup cxtB em
     pure $ entropyA `bp` entropyB
 
-boundaryIC :: BoundaryPolicy -> InfoContentMap -> (Token, Token) -> (Context, Context) -> Boundary
-boundaryIC (BoundaryPolicy bp) (InfoContentMap (ContextMap im)) (tknA, tknB) (cxtA, cxtB) =
+icBoundary :: BoundaryPolicy -> InfoContentMap -> (Token, Token) -> (Context, Context) -> Boundary
+icBoundary (BoundaryPolicy bp) (InfoContentMap (ContextMap im)) (tknA, tknB) (cxtA, cxtB) =
   fromMaybe NoBoundary $ do
     imA <- M.lookup cxtA im
     icA <- M.lookup tknA imA
@@ -191,93 +192,33 @@ unionBoundary NoBoundary NoBoundary = NoBoundary
 unionBoundary _ Boundary = Boundary
 unionBoundary Boundary _ = Boundary
 
-icSuffixSegments :: Order -> BoundaryPolicy -> InfoContentMap -> [Token] -> [Segment]
-icSuffixSegments (Order k) bp im ts = go ts initial
+-- (target, (suffix_a, suffix_b), (prefix_a, prefix_b))
+-- TODO: Handle edges of token list
+contexts :: Order -> [Token] -> [(Token, (Context, Context), (Context, Context))]
+contexts (Order k) ts = zip3 (drop k ts) (contextPairs (Order k) ts) (contextPairs (Order k) $ drop k ts)
+
+contextPairs :: Order -> [Token] -> [(Context, Context)]
+contextPairs k (t : ts) = zip (map window2context (windows k (t : ts))) (map window2context (windows k ts))
+
+window2context :: Window -> Context
+window2context (Window w) = Context w
+
+-- TODO: Handle edges of token list
+entropyFold :: Order -> BoundaryPolicy -> (EntropyMap, EntropyMap) -> [Token] -> [Segment]
+entropyFold (Order k) bp (pm, sm) ts = snd $ foldr f initial (contexts (Order k) ts)
   where
-    initial = Segment $ reverse $ take k ts
-    go (t : ts) (Segment s)
-      | length ts < k + 1 = [Segment (reverse (t' : s))]
-      | otherwise = case boundaryIC bp im tkns cxts of
-        Boundary -> Segment (reverse (t' : s)) : go ts (Segment [])
-        NoBoundary -> go ts $ Segment (t' : s)
+    initial = (Segment [], [])
+    f (t', suffixCxts, prefixCxts) (Segment s, segments) = case isBoundary of
+      Boundary -> (Segment [t'], Segment s : segments)
+      NoBoundary -> (Segment (t' : s), segments)
       where
-        t' = (t : ts) !! k
-        tkns = (t, head ts)
-        cxts = (Context $ take k (t : ts), Context $ take k ts)
-
-segmentBySuffixIC :: Int -> String -> [String]
-segmentBySuffixIC k s =
-  map show $
-    icSuffixSegments (Order k) rise (im s) (tokenizeString s)
-  where
-    im = infoContentMap . markovChain . suffixTransitionMap (Order k) . tokenizeString
-
-suffixSegments :: Order -> BoundaryPolicy -> EntropyMap -> [Token] -> [Segment]
-suffixSegments (Order k) bp em ts = go ts initial
-  where
-    initial = Segment $ reverse $ take k ts
-    go (t : ts) (Segment s)
-      | length ts < k + 1 = [Segment (reverse (t' : s))]
-      | otherwise = case boundary bp em cxts of
-        Boundary -> Segment (reverse (t' : s)) : go ts (Segment [])
-        NoBoundary -> go ts $ Segment (t' : s)
-      where
-        t' = (t : ts) !! k
-        cxts = (Context $ take k (t : ts), Context $ take k ts)
-
-segmentBySuffixEntropy :: Int -> String -> [String]
-segmentBySuffixEntropy k s =
-  map show $
-    suffixSegments (Order k) rise (em s) (tokenizeString s)
-  where
-    em = entropyMap . markovChain . suffixTransitionMap (Order k) . tokenizeString
-
-prefixSegments :: Order -> BoundaryPolicy -> EntropyMap -> [Token] -> [Segment]
-prefixSegments (Order k) bp em ts = go ts initial
-  where
-    initial = Segment []
-    go (t : ts) (Segment s)
-      | length ts < k + 1 = [Segment (reverse s ++ (t : ts))]
-      | otherwise = case boundary bp em cxts of
-        Boundary -> Segment (reverse s) : go ts (Segment [t])
-        NoBoundary -> go ts $ Segment (t : s)
-      where
-        cxts = (Context $ take k (t : ts), Context $ take k ts)
-
-segmentByPrefixEntropy :: Int -> String -> [String]
-segmentByPrefixEntropy k s =
-  map show $
-    prefixSegments (Order k) rise (em s) (tokenizeString s)
-  where
-    em = entropyMap . markovChain . prefixTransitionMap (Order k) . tokenizeString
-
--- Note: suffixSegments is Order k ahead of prefixSegments in the list
-
-boundarySegments :: Order -> BoundaryPolicy -> (EntropyMap, EntropyMap) -> [Token] -> [Segment]
-boundarySegments (Order k) bp (pm, sm) ts = go ts initial
-  where
-    initial = Segment $ reverse $ take k ts
-    go (t : ts) (Segment s)
-      | length ts < k = [Segment (reverse s) | not (null s)]
-      | otherwise = case unionBoundary prefixBoundary suffixBoundary of
-        Boundary -> Segment (reverse (t' : s)) : go ts (Segment [])
-        NoBoundary -> go ts $ Segment (t' : s)
-      where
-        t' = (t : ts) !! k
-        prefixBoundary = boundary bp pm prefixContexts
-        suffixBoundary = boundary bp sm suffixContexts
-        prefixContexts =
-          ( Context $ (take k . drop k) (t : ts),
-            Context $ (take k . drop k) ts
-          )
-        suffixContexts =
-          ( Context $ take k (t : ts),
-            Context $ take k ts
-          )
+        isBoundary = unionBoundary isPrefixBoundary isSuffixBoundary
+        isPrefixBoundary = entropyBoundary bp pm prefixCxts
+        isSuffixBoundary = entropyBoundary bp sm suffixCxts
 
 segmentByBoundaryEntropy :: Order -> [Token] -> [Segment]
 segmentByBoundaryEntropy k ts =
-  boundarySegments k rise (pm ts, sm ts) ts
+  entropyFold k rise (pm ts, sm ts) ts
   where
     pm = entropyMap . markovChain . prefixTransitionMap k
     sm = entropyMap . markovChain . suffixTransitionMap k
@@ -285,7 +226,7 @@ segmentByBoundaryEntropy k ts =
 nestedBES :: Count -> Order -> [Token] -> [Token]
 nestedBES i k ts
   | i < 1 = ts
-  | otherwise = nestedBES (i-1) k $ map tokenize $ segmentByBoundaryEntropy k ts
+  | otherwise = nestedBES (i - 1) k $ map tokenize $ segmentByBoundaryEntropy k ts
 
 --------------------------------------------------------------------------------
 -- Input
@@ -295,15 +236,18 @@ nestedBesText depth k fileName = do
   text <- readFile fileName
   let contents = preprocessText text
       segments = nestedBES depth (Order k) contents
-  print $ take 100 segments
+  print $ (take 500 . drop 10000) segments
   return ()
 
 segmentTextWithOrder :: Int -> String -> IO ()
 segmentTextWithOrder = nestedBesText 1
 
+tokenChar :: Char -> Token
+tokenChar c = Token [c]
+
 preprocessText :: String -> [Token]
 preprocessText =
-  map (Token . (: []) . replaceDigit . toLower) . filter isAlphaNum . filter isAscii
+  map (tokenChar . replaceDigit . toLower) . filter isAlphaNum . filter isAscii
 
 replaceDigit :: Char -> Char
 replaceDigit x

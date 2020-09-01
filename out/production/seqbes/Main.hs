@@ -3,4 +3,4 @@ module Main where
 import Lib
 
 main :: IO ()
-main = someFunc
+main = segmentTextWithOrder 1 "./data/moby-dick.txt"
