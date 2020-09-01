@@ -7,7 +7,7 @@ module Lib where
 import Data.Char
 import qualified Data.HashMap.Lazy as M
 import Data.Hashable
-import Data.List (intercalate, tails)
+import Data.List (inits, intercalate, tails)
 import Data.Maybe (fromMaybe)
 import System.Environment
 
@@ -163,11 +163,13 @@ rise :: BoundaryPolicy
 rise = BoundaryPolicy (\x y -> if x < y then Boundary else NoBoundary)
 
 entropyBoundary :: BoundaryPolicy -> EntropyMap -> (Context, Context) -> Boundary
-entropyBoundary (BoundaryPolicy bp) (EntropyMap em) (cxtA, cxtB) =
-  fromMaybe NoBoundary $ do
-    entropyA <- M.lookup cxtA em
-    entropyB <- M.lookup cxtB em
-    pure $ entropyA `bp` entropyB
+entropyBoundary (BoundaryPolicy bp) (EntropyMap em) (cxtA, cxtB)
+  | (cxtA, cxtB) == (Context [], Context []) = Boundary  -- Hack
+  | otherwise = fromMaybe NoBoundary $
+    do
+      entropyA <- M.lookup cxtA em
+      entropyB <- M.lookup cxtB em
+      pure $ entropyA `bp` entropyB
 
 icBoundary :: BoundaryPolicy -> InfoContentMap -> ((Token, Context), (Token, Context)) -> Boundary
 icBoundary (BoundaryPolicy bp) (InfoContentMap (ContextMap im)) ((tknA, cxtA), (tknB, cxtB)) =
@@ -189,12 +191,20 @@ intersectionBoundary _ NoBoundary = NoBoundary
 intersectionBoundary NoBoundary _ = NoBoundary
 
 -- (target, (suffix_a, suffix_b), (prefix_a, prefix_b))
--- TODO: Handle edges of token list
-contexts :: Order -> [Token] -> [(Token, (Context, Context), (Context, Context))]
-contexts (Order k) ts = zip3 (drop k ts) (contextPairs (Order k) ts) (contextPairs (Order k) $ drop k ts)
+frames :: Order -> [Token] -> [(Token, (Context, Context), (Context, Context))]
+frames (Order k) ts =
+  (Token [], (Context [], Context []), (Context [], Context [])) :   -- Hack
+  zip3 ts (starts ++ contextPairs (Order k) ts) (contextPairs (Order k) ts ++ ends)
+  where
+    (x : xs) = (take (k + 1) . map Context . inits) ts
+    starts = zip (x : xs) xs
+    (y : ys) = (reverse . take (k + 1) . map (Context . reverse) . inits . reverse) ts
+    ends = zip (y : ys) ys
 
 contextPairs :: Order -> [Token] -> [(Context, Context)]
-contextPairs k (t : ts) = zip (map window2context (windows k (t : ts))) (map window2context (windows k ts))
+contextPairs k (t : ts) = zip (contexts (t : ts)) (contexts ts)
+  where
+    contexts xs = map window2context $ windows k xs
 
 window2context :: Window -> Context
 window2context (Window w) = Context w
@@ -202,22 +212,20 @@ window2context (Window w) = Context w
 context2window :: Context -> Window
 context2window (Context c) = Window c
 
--- TODO: Handle edges of token list
 entropyFold :: Order -> BoundaryPolicy -> (EntropyMap, EntropyMap) -> [Token] -> [Segment]
-entropyFold (Order k) bp (pm, sm) ts = snd $ foldr f initial (contexts (Order k) ts)
+entropyFold k bp (pm, sm) ts = snd $ foldr boundaryFrame initial $ frames k ts
   where
     initial = (Segment [], [])
-    f (t', suffixCxts, prefixCxts) (Segment s, segments) = case isBoundary of
-      Boundary -> (Segment [t'], Segment s : segments)
-      NoBoundary -> (Segment (t' : s), segments)
+    boundaryFrame (t, suffixCxts, prefixCxts) (Segment s, segments) = case isBoundary of
+      Boundary -> (Segment [t], Segment s : segments)
+      NoBoundary -> (Segment (t : s), segments)
       where
         isBoundary = unionBoundary isPrefixBoundary isSuffixBoundary
         isPrefixBoundary = entropyBoundary bp pm prefixCxts
         isSuffixBoundary = entropyBoundary bp sm suffixCxts
 
--- TODO: Handle edges of token list
 icFold :: Order -> BoundaryPolicy -> (InfoContentMap, InfoContentMap) -> [Token] -> [Segment]
-icFold (Order k) bp (pm, sm) ts = snd $ foldr f initial (contexts (Order (k+1)) ts)
+icFold (Order k) bp (pm, sm) ts = snd $ foldr f initial (frames (Order (k + 1)) ts)
   where
     initial = (Segment [], [])
     f (t', suffixWs, prefixWs) (Segment s, segments) = case isBoundary of
@@ -262,7 +270,7 @@ nestedEntropyText depth k fileName = do
   text <- readFile fileName
   let contents = preprocessText text
       segments = nestedEntropy depth (Order k) contents
-  print $ (take 500 . drop 10000) segments
+  print $ take 100 segments
   return ()
 
 nestedInfoContentText :: Integer -> Int -> String -> IO ()
@@ -270,7 +278,7 @@ nestedInfoContentText depth k fileName = do
   text <- readFile fileName
   let contents = preprocessText text
       segments = nestedInfoContent depth (Order k) contents
-  print $ (take 500 . drop 10000) segments
+  print $ take 100 segments
   return ()
 
 segmentTextWithOrder :: Int -> String -> IO ()
@@ -280,10 +288,24 @@ tokenChar :: Char -> Token
 tokenChar c = Token [c]
 
 preprocessText :: String -> [Token]
-preprocessText =
-  map (tokenChar . toLower) . filter isAlpha . filter isAscii
+preprocessText = map (tokenChar . toLower) . filter isLetter . filter isAscii
 
-replaceDigit :: Char -> Char
-replaceDigit x
-  | isDigit x = '#'
-  | otherwise = x
+--------------------------------------------------------------------------------
+-- Ground Truth
+
+groundTruth :: String -> [Token]
+groundTruth s =
+  map Token $
+    (words . map toLower . filter ((||) <$> isLetter <*> isSpace) . filter isAscii) s
+
+precision :: [Token] -> [Token] -> Double
+precision source target = undefined
+
+recall :: [Token] -> [Token] -> Double
+recall source target = undefined
+
+fmeasure :: [Token] -> [Token] -> Double
+fmeasure source target = 2 * p * r / (p + r)
+  where
+    p = precision source target
+    r = recall source target

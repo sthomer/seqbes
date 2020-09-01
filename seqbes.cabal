@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: f905ce0174527b9fb446cfbfd4a90766c017d23b0e1e995194923d6135fbbd65
+-- hash: fdba758ab5184804878b14bb3068d7b1fdc6004409e72f751ee7eafafeba4a34
 
 name:           seqbes
 version:        0.1.0.0
@@ -28,6 +28,7 @@ source-repository head
 library
   exposed-modules:
       Lib
+      Warehouse
   other-modules:
       Paths_seqbes
   hs-source-dirs:
