@@ -7,9 +7,11 @@ module Lib where
 import Data.Char
 import qualified Data.HashMap.Lazy as M
 import Data.Hashable
-import Data.List (inits, intercalate, tails)
+import Data.List (inits, intercalate, tails, genericLength, intersect)
 import Data.Maybe (fromMaybe)
 import System.Environment
+import qualified Data.Set as Set
+import Numeric
 
 --------------------------------------------------------------------------------
 
@@ -41,6 +43,10 @@ data Boundary = Boundary | NoBoundary
 newtype BoundaryPolicy = BoundaryPolicy (Entropy -> Entropy -> Boundary)
 
 newtype Order = Order Int
+
+newtype Frame = Frame (Token, (Context, Context), (Context, Context))
+
+newtype Score = Score (Double, Double, Double)
 
 type Count = Integer
 
@@ -85,6 +91,10 @@ instance Show Segment where
 instance Show Token where
   show (Token t) = t
 
+instance Show Score where
+  show (Score (p, r, f)) = intercalate "\t" $
+    map ((\s -> s "") . showFFloat (Just 3)) [p, r, f]
+
 --------------------------------------------------------------------------------
 -- Construction
 
@@ -105,11 +115,11 @@ increment (tkn, cxt) (TransitionMap (ContextMap tm)) =
     ContextMap $
       M.insertWith (M.unionWith (+)) cxt (M.singleton tkn 1) tm
 
-count :: (Window -> (Token, Context)) -> [Window] -> TransitionMap
-count split = foldr (increment . split) (TransitionMap $ ContextMap M.empty)
+countTransitions :: (Window -> (Token, Context)) -> [Window] -> TransitionMap
+countTransitions split = foldr (increment . split) (TransitionMap $ ContextMap M.empty)
 
 transitionMapWith :: (Window -> (Token, Context)) -> Order -> [Token] -> TransitionMap
-transitionMapWith split (Order k) = count split . windows (Order (k + 1))
+transitionMapWith split (Order k) = countTransitions split . windows (Order (k + 1))
 
 suffixSplit :: Window -> (Token, Context)
 suffixSplit (Window ts) = (last ts, Context (init ts))
@@ -164,7 +174,7 @@ rise = BoundaryPolicy (\x y -> if x < y then Boundary else NoBoundary)
 
 entropyBoundary :: BoundaryPolicy -> EntropyMap -> (Context, Context) -> Boundary
 entropyBoundary (BoundaryPolicy bp) (EntropyMap em) (cxtA, cxtB)
-  | (cxtA, cxtB) == (Context [], Context []) = Boundary  -- Hack
+  | (cxtA, cxtB) == (Context [], Context []) = Boundary -- Hack
   | otherwise = fromMaybe NoBoundary $
     do
       entropyA <- M.lookup cxtA em
@@ -190,11 +200,16 @@ intersectionBoundary Boundary Boundary = Boundary
 intersectionBoundary _ NoBoundary = NoBoundary
 intersectionBoundary NoBoundary _ = NoBoundary
 
+emptyFrame :: Frame
+emptyFrame = Frame (Token [], (Context [], Context []), (Context [], Context []))
+
 -- (target, (suffix_a, suffix_b), (prefix_a, prefix_b))
-frames :: Order -> [Token] -> [(Token, (Context, Context), (Context, Context))]
+frames :: Order -> [Token] -> [Frame]
 frames (Order k) ts =
-  (Token [], (Context [], Context []), (Context [], Context [])) :   -- Hack
-  zip3 ts (starts ++ contextPairs (Order k) ts) (contextPairs (Order k) ts ++ ends)
+  emptyFrame : map Frame (zip3
+    ts
+    (starts ++ contextPairs (Order k) ts)
+    (contextPairs (Order k) ts ++ ends))
   where
     (x : xs) = (take (k + 1) . map Context . inits) ts
     starts = zip (x : xs) xs
@@ -216,7 +231,7 @@ entropyFold :: Order -> BoundaryPolicy -> (EntropyMap, EntropyMap) -> [Token] ->
 entropyFold k bp (pm, sm) ts = snd $ foldr boundaryFrame initial $ frames k ts
   where
     initial = (Segment [], [])
-    boundaryFrame (t, suffixCxts, prefixCxts) (Segment s, segments) = case isBoundary of
+    boundaryFrame (Frame (t, suffixCxts, prefixCxts)) (Segment s, segments) = case isBoundary of
       Boundary -> (Segment [t], Segment s : segments)
       NoBoundary -> (Segment (t : s), segments)
       where
@@ -228,7 +243,7 @@ icFold :: Order -> BoundaryPolicy -> (InfoContentMap, InfoContentMap) -> [Token]
 icFold (Order k) bp (pm, sm) ts = snd $ foldr f initial (frames (Order (k + 1)) ts)
   where
     initial = (Segment [], [])
-    f (t', suffixWs, prefixWs) (Segment s, segments) = case isBoundary of
+    f (Frame (t', suffixWs, prefixWs)) (Segment s, segments) = case isBoundary of
       Boundary -> (Segment [t'], Segment s : segments)
       NoBoundary -> (Segment (t' : s), segments)
       where
@@ -265,9 +280,32 @@ nestedInfoContent i k ts
 --------------------------------------------------------------------------------
 -- Input
 
+evaluateText :: String -> IO ()
+evaluateText filename = do
+  text <- readFile filename
+  (putStr . unlines . evaluate) text
+
+evaluate :: String -> [String]
+evaluate text = do
+  depth <- [9..10]
+  order <- [1..3]
+  let ground = groundTruth text
+      contents = preprocessText text
+      segments = nestedEntropy depth (Order order) contents
+  return $
+    show depth ++ "\t" ++ show order ++ "\t" ++ show (quality ground segments)
+
+evaluateAtDepthOrder :: Integer -> Int -> String -> IO ()
+evaluateAtDepthOrder depth k filename = do
+  text <- readFile filename
+  let ground = groundTruth text
+      contents = preprocessText text
+      segments = nestedEntropy depth (Order k) contents
+  print $ quality ground segments
+
 nestedEntropyText :: Integer -> Int -> String -> IO ()
-nestedEntropyText depth k fileName = do
-  text <- readFile fileName
+nestedEntropyText depth k filename = do
+  text <- readFile filename
   let contents = preprocessText text
       segments = nestedEntropy depth (Order k) contents
   print $ take 100 segments
@@ -294,18 +332,40 @@ preprocessText = map (tokenChar . toLower) . filter isLetter . filter isAscii
 -- Ground Truth
 
 groundTruth :: String -> [Token]
-groundTruth s =
-  map Token $
-    (words . map toLower . filter ((||) <$> isLetter <*> isSpace) . filter isAscii) s
+groundTruth =
+  map Token . words . map toLower . filter ((||) <$> isLetter <*> isSpace) . filter isAscii
+
+-- Since we're comparing sets, the direction of the scan doesn't actually matter
+-- Therefore, indices are counted from the end of the list to the front
+boundaryIndices :: [Token] -> Set.Set Int
+boundaryIndices ts = Set.fromDistinctDescList $
+  (tail . scanr1 (+) . map (\(Token t) -> genericLength t)) ts
 
 precision :: [Token] -> [Token] -> Double
-precision source target = undefined
+precision source target = fromIntegral correct / fromIntegral found
+  where
+    correct = Set.size $ boundaryIndices source `Set.intersection` boundaryIndices target
+    found = length target - 1
 
 recall :: [Token] -> [Token] -> Double
-recall source target = undefined
+recall source target = fromIntegral correct / fromIntegral total
+  where
+    correct = Set.size $ boundaryIndices source `Set.intersection` boundaryIndices target
+    total = length source - 1
 
 fmeasure :: [Token] -> [Token] -> Double
 fmeasure source target = 2 * p * r / (p + r)
   where
     p = precision source target
     r = recall source target
+
+quality :: [Token] -> [Token] -> Score
+quality source target = Score (p, r, f)
+  where
+    correct = Set.size $ boundaryIndices source `Set.intersection` boundaryIndices target
+    found = length target - 1
+    total = length source - 1
+    p = if found == 0 then 0 else
+      fromIntegral correct / fromIntegral found
+    r = fromIntegral correct / fromIntegral total
+    f = 2 * p * r / (p + r)

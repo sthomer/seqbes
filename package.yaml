@@ -27,6 +27,7 @@ dependencies:
 - hspec
 - hashable
 - scientific
+- containers
 
 library:
   source-dirs: src

@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: fdba758ab5184804878b14bb3068d7b1fdc6004409e72f751ee7eafafeba4a34
+-- hash: 4e73717a62c44a3d424640a05ca8b5d8b7f2733cd0b699a61eadf5f939c1dfef
 
 name:           seqbes
 version:        0.1.0.0
@@ -37,6 +37,7 @@ library
       HUnit
     , QuickCheck
     , base >=4.7 && <5
+    , containers
     , hashable
     , hspec
     , scientific
@@ -54,6 +55,7 @@ executable seqbes-exe
       HUnit
     , QuickCheck
     , base >=4.7 && <5
+    , containers
     , hashable
     , hspec
     , scientific
@@ -73,6 +75,7 @@ test-suite seqbes-test
       HUnit
     , QuickCheck
     , base >=4.7 && <5
+    , containers
     , hashable
     , hspec
     , scientific
