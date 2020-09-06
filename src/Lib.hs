@@ -1,4 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE TupleSections #-}
 
 module Lib where
 
@@ -7,11 +8,11 @@ module Lib where
 import Data.Char
 import qualified Data.HashMap.Lazy as M
 import Data.Hashable
-import Data.List (inits, intercalate, tails, genericLength, intersect)
+import Data.List (genericLength, inits, intercalate, intersect, sort, sortOn, tails)
 import Data.Maybe (fromMaybe)
-import System.Environment
 import qualified Data.Set as Set
 import Numeric
+import System.Environment
 
 --------------------------------------------------------------------------------
 
@@ -22,17 +23,33 @@ newtype ContextMap a = ContextMap (M.HashMap Context (M.HashMap Token a))
 -- newtype ContextMap a = ContextMap (M.HashMap Context a)
 -- newtype TokenMap a = TokenMap (M.HashMap Token a)
 
-newtype EntropyMap = EntropyMap (M.HashMap Context Entropy) deriving (Show)
+class Affix a
 
-newtype InfoContentMap = InfoContentMap (ContextMap InfoContent)
+data Prefix
 
-newtype MarkovChain = MarkovChain (ContextMap Probability)
+instance Affix Prefix
 
-newtype TransitionMap = TransitionMap (ContextMap Count)
+data Suffix
 
-newtype Token = Token String deriving (Eq, Hashable)
+instance Affix Suffix
 
-newtype Context = Context [Token] deriving (Eq, Hashable)
+data Infix
+
+instance Affix Infix
+
+newtype EntropyMap a = EntropyMap (M.HashMap Context Entropy)
+
+newtype InfoContentMap a = InfoContentMap (ContextMap InfoContent)
+
+newtype MarkovChain a = MarkovChain (ContextMap Probability)
+
+newtype TransitionMap a = TransitionMap (ContextMap Count)
+
+newtype FrequencyMap = FrequencyMap (M.HashMap Context Probability)
+
+newtype Token = Token String deriving (Eq, Hashable, Ord)
+
+newtype Context = Context [Token] deriving (Eq, Hashable, Ord)
 
 newtype Window = Window [Token]
 
@@ -44,11 +61,13 @@ newtype BoundaryPolicy = BoundaryPolicy (Entropy -> Entropy -> Boundary)
 
 newtype Order = Order Int
 
+newtype Depth = Depth Int
+
+newtype Count = Count Integer deriving (Num, Eq, Ord, Real, Show)
+
 newtype Frame = Frame (Token, (Context, Context), (Context, Context))
 
 newtype Score = Score (Double, Double, Double)
-
-type Count = Integer
 
 type Probability = Double
 
@@ -58,17 +77,29 @@ type InfoContent = Double
 
 type Standard = Double
 
+type FileName = String
+
 --------------------------------------------------------------------------------
 -- Display
 
-instance Show TransitionMap where
+instance Show (TransitionMap a) where
   show (TransitionMap tm) = show tm
 
-instance Show MarkovChain where
+instance Show (MarkovChain a) where
   show (MarkovChain mc) = show mc
 
-instance Show InfoContentMap where
+instance Show (InfoContentMap a) where
   show (InfoContentMap im) = show im
+
+instance Show (EntropyMap a) where
+  show (EntropyMap em) = intercalate "\n" $ map showEntry $ sortOn snd (M.toList em)
+    where
+      showEntry (t, n) = show t ++ ": " ++ showFFloat (Just 3) n ""
+
+instance Show FrequencyMap where
+  show (FrequencyMap em) = intercalate "\n" $ sort $ map showEntry (M.toList em)
+    where
+      showEntry (t, n) = show t ++ ": " ++ showFFloat (Just 3) (n * 100) ""
 
 instance (Show a) => Show (ContextMap a) where
   show (ContextMap cm) =
@@ -92,8 +123,15 @@ instance Show Token where
   show (Token t) = t
 
 instance Show Score where
-  show (Score (p, r, f)) = intercalate "\t" $
-    map ((\s -> s "") . showFFloat (Just 3)) [p, r, f]
+  show (Score (p, r, f)) =
+    intercalate "\t" $
+      map ((\s -> s "") . showFFloat (Just 3)) [p, r, f]
+
+instance Show Order where
+  show (Order k) = show k
+
+instance Show Depth where
+  show (Depth d) = show d
 
 --------------------------------------------------------------------------------
 -- Construction
@@ -104,21 +142,30 @@ tokenize (Segment ts) = Token $ concatMap (\(Token t) -> t) ts
 tokenizeString :: String -> [Token]
 tokenizeString = map (\c -> Token [c])
 
+tokenizeChar :: Char -> Token
+tokenizeChar c = Token [c]
+
+toContext :: Window -> Context
+toContext (Window w) = Context w
+
+toWindow :: Context -> Window
+toWindow (Context c) = Window c
+
 windows :: Order -> [Token] -> [Window]
 windows (Order n) ts =
   map Window $
     (foldr (zipWith (:)) (repeat []) . take n . tails) ts
 
-increment :: (Token, Context) -> TransitionMap -> TransitionMap
+increment :: (Token, Context) -> TransitionMap a -> TransitionMap a
 increment (tkn, cxt) (TransitionMap (ContextMap tm)) =
   TransitionMap $
     ContextMap $
       M.insertWith (M.unionWith (+)) cxt (M.singleton tkn 1) tm
 
-countTransitions :: (Window -> (Token, Context)) -> [Window] -> TransitionMap
+countTransitions :: (Window -> (Token, Context)) -> [Window] -> TransitionMap a
 countTransitions split = foldr (increment . split) (TransitionMap $ ContextMap M.empty)
 
-transitionMapWith :: (Window -> (Token, Context)) -> Order -> [Token] -> TransitionMap
+transitionMapWith :: (Window -> (Token, Context)) -> Order -> [Token] -> TransitionMap a
 transitionMapWith split (Order k) = countTransitions split . windows (Order (k + 1))
 
 suffixSplit :: Window -> (Token, Context)
@@ -127,29 +174,44 @@ suffixSplit (Window ts) = (last ts, Context (init ts))
 prefixSplit :: Window -> (Token, Context)
 prefixSplit (Window ts) = (head ts, Context (tail ts))
 
-prefixTransitionMap :: Order -> [Token] -> TransitionMap
+prefixTransitionMap :: Order -> [Token] -> TransitionMap Prefix
 prefixTransitionMap = transitionMapWith prefixSplit
 
-suffixTransitionMap :: Order -> [Token] -> TransitionMap
+suffixTransitionMap :: Order -> [Token] -> TransitionMap Suffix
 suffixTransitionMap = transitionMapWith suffixSplit
 
-markovChain :: TransitionMap -> MarkovChain
-markovChain (TransitionMap (ContextMap tm)) =
-  MarkovChain $
-    ContextMap $
-      M.map asDist tm
+markovChain :: TransitionMap a -> MarkovChain a
+markovChain (TransitionMap (ContextMap tm)) = MarkovChain $ ContextMap $ M.map asDist tm
   where
-    asDist mem = M.map ((/ total mem) . fromInteger) mem
-    total = fromInteger . sum . M.elems
+    asDist cxt = M.map ((/ total cxt) . realToFrac) cxt
+    total = realToFrac . sum . M.elems
 
-entropyMap :: MarkovChain -> EntropyMap
-entropyMap (MarkovChain (ContextMap mc)) =
-  EntropyMap $
-    M.map asEntropy mc
+frequencyMap :: Order -> [Token] -> FrequencyMap
+frequencyMap k ts = FrequencyMap $ M.map (/ total) fs
   where
-    asEntropy = entropy . M.elems
+    fs = (M.fromListWith (+) . map ((,1) . toContext)) (windows k ts)
+    total = genericLength ts
 
-infoContentMap :: MarkovChain -> InfoContentMap
+prefixEntropyMap :: Order -> [Token] -> EntropyMap Prefix
+prefixEntropyMap k = entropyMap . markovChain . prefixTransitionMap k
+
+suffixEntropyMap :: Order -> [Token] -> EntropyMap Suffix
+suffixEntropyMap k = entropyMap . markovChain . suffixTransitionMap k
+
+infixEntropyMap :: EntropyMap Prefix -> EntropyMap Suffix -> EntropyMap Infix
+infixEntropyMap (EntropyMap pm) (EntropyMap sm) = EntropyMap $ M.unionWith (-) pm sm
+
+entropyMap :: MarkovChain a -> EntropyMap a
+entropyMap (MarkovChain (ContextMap mc)) = EntropyMap $ M.map (entropy . M.elems) mc
+
+standardMap :: EntropyMap a -> FrequencyMap -> EntropyMap a
+standardMap (EntropyMap em) (FrequencyMap fm) = EntropyMap $ M.map standardize em
+  where
+    mean = sum $ M.elems $ M.unionWith (*) em fm
+    sd = sqrt $ sum $ M.elems $ M.unionWith (*) fm (M.map (\e -> (e - mean) ^ 2) em)
+    standardize e = (e - mean) / sd
+
+infoContentMap :: MarkovChain a -> InfoContentMap a
 infoContentMap (MarkovChain (ContextMap mc)) =
   InfoContentMap $
     ContextMap $
@@ -169,10 +231,12 @@ entropy = sum . map (\p -> p * infoContent p)
 --------------------------------------------------------------------------------
 -- Segmentation
 
-rise :: BoundaryPolicy
-rise = BoundaryPolicy (\x y -> if x < y then Boundary else NoBoundary)
+rise :: Entropy -> Entropy -> Boundary
+rise x y
+  | x < y = Boundary
+  | otherwise = NoBoundary
 
-entropyBoundary :: BoundaryPolicy -> EntropyMap -> (Context, Context) -> Boundary
+entropyBoundary :: BoundaryPolicy -> EntropyMap a -> (Context, Context) -> Boundary
 entropyBoundary (BoundaryPolicy bp) (EntropyMap em) (cxtA, cxtB)
   | (cxtA, cxtB) == (Context [], Context []) = Boundary -- Hack
   | otherwise = fromMaybe NoBoundary $
@@ -181,7 +245,7 @@ entropyBoundary (BoundaryPolicy bp) (EntropyMap em) (cxtA, cxtB)
       entropyB <- M.lookup cxtB em
       pure $ entropyA `bp` entropyB
 
-icBoundary :: BoundaryPolicy -> InfoContentMap -> ((Token, Context), (Token, Context)) -> Boundary
+icBoundary :: BoundaryPolicy -> InfoContentMap a -> ((Token, Context), (Token, Context)) -> Boundary
 icBoundary (BoundaryPolicy bp) (InfoContentMap (ContextMap im)) ((tknA, cxtA), (tknB, cxtB)) =
   fromMaybe NoBoundary $ do
     imA <- M.lookup cxtA im
@@ -195,21 +259,19 @@ unionBoundary NoBoundary NoBoundary = NoBoundary
 unionBoundary _ Boundary = Boundary
 unionBoundary Boundary _ = Boundary
 
-intersectionBoundary :: Boundary -> Boundary -> Boundary
-intersectionBoundary Boundary Boundary = Boundary
-intersectionBoundary _ NoBoundary = NoBoundary
-intersectionBoundary NoBoundary _ = NoBoundary
-
 emptyFrame :: Frame
 emptyFrame = Frame (Token [], (Context [], Context []), (Context [], Context []))
 
--- (target, (suffix_a, suffix_b), (prefix_a, prefix_b))
 frames :: Order -> [Token] -> [Frame]
 frames (Order k) ts =
-  emptyFrame : map Frame (zip3
-    ts
-    (starts ++ contextPairs (Order k) ts)
-    (contextPairs (Order k) ts ++ ends))
+  emptyFrame :
+  map
+    Frame
+    ( zip3
+        ts
+        (starts ++ contextPairs (Order k) ts)
+        (contextPairs (Order k) ts ++ ends)
+    )
   where
     (x : xs) = (take (k + 1) . map Context . inits) ts
     starts = zip (x : xs) xs
@@ -219,15 +281,9 @@ frames (Order k) ts =
 contextPairs :: Order -> [Token] -> [(Context, Context)]
 contextPairs k (t : ts) = zip (contexts (t : ts)) (contexts ts)
   where
-    contexts xs = map window2context $ windows k xs
+    contexts xs = map toContext $ windows k xs
 
-window2context :: Window -> Context
-window2context (Window w) = Context w
-
-context2window :: Context -> Window
-context2window (Context c) = Window c
-
-entropyFold :: Order -> BoundaryPolicy -> (EntropyMap, EntropyMap) -> [Token] -> [Segment]
+entropyFold :: Order -> BoundaryPolicy -> (EntropyMap Prefix, EntropyMap Suffix) -> [Token] -> [Segment]
 entropyFold k bp (pm, sm) ts = snd $ foldr boundaryFrame initial $ frames k ts
   where
     initial = (Segment [], [])
@@ -239,7 +295,7 @@ entropyFold k bp (pm, sm) ts = snd $ foldr boundaryFrame initial $ frames k ts
         isPrefixBoundary = entropyBoundary bp pm prefixCxts
         isSuffixBoundary = entropyBoundary bp sm suffixCxts
 
-icFold :: Order -> BoundaryPolicy -> (InfoContentMap, InfoContentMap) -> [Token] -> [Segment]
+icFold :: Order -> BoundaryPolicy -> (InfoContentMap Prefix, InfoContentMap Suffix) -> [Token] -> [Segment]
 icFold (Order k) bp (pm, sm) ts = snd $ foldr f initial (frames (Order (k + 1)) ts)
   where
     initial = (Segment [], [])
@@ -249,87 +305,87 @@ icFold (Order k) bp (pm, sm) ts = snd $ foldr f initial (frames (Order (k + 1)) 
       where
         (pa, pb) = prefixWs
         (sa, sb) = suffixWs
-        prefixTknCxts = (prefixSplit (context2window pa), prefixSplit (context2window pb))
-        suffixTknCxts = (suffixSplit (context2window sa), suffixSplit (context2window sb))
+        prefixTknCxts = (prefixSplit (toWindow pa), prefixSplit (toWindow pb))
+        suffixTknCxts = (suffixSplit (toWindow sa), suffixSplit (toWindow sb))
         isPrefixBoundary = icBoundary bp pm prefixTknCxts
         isSuffixBoundary = icBoundary bp sm suffixTknCxts
         isBoundary = unionBoundary isPrefixBoundary isSuffixBoundary
 
 segmentByBoundaryEntropy :: Order -> [Token] -> [Segment]
-segmentByBoundaryEntropy k ts = entropyFold k rise (pm ts, sm ts) ts
-  where
-    pm = entropyMap . markovChain . prefixTransitionMap k
-    sm = entropyMap . markovChain . suffixTransitionMap k
+segmentByBoundaryEntropy k ts = 
+  entropyFold k (BoundaryPolicy rise) (prefixEntropyMap k ts, suffixEntropyMap k ts) ts
 
 segmentByBoundaryIC :: Order -> [Token] -> [Segment]
-segmentByBoundaryIC k ts = icFold k rise (pm ts, sm ts) ts
+segmentByBoundaryIC k ts = icFold k (BoundaryPolicy rise) (pm ts, sm ts) ts
   where
     pm = infoContentMap . markovChain . prefixTransitionMap k
     sm = infoContentMap . markovChain . suffixTransitionMap k
 
-nestedEntropy :: Count -> Order -> [Token] -> [Token]
-nestedEntropy i k ts
-  | i < 1 = ts
-  | otherwise = nestedEntropy (i - 1) k $ map tokenize $ segmentByBoundaryEntropy k ts
+nestedSegmentation :: (Order -> [Token] -> [Segment]) -> Depth -> Order -> [Token] -> [Token]
+nestedSegmentation f (Depth d) k ts
+  | d < 1 = ts
+  | otherwise = nestedSegmentation f (Depth (d - 1)) k $ map tokenize $ f k ts
 
-nestedInfoContent :: Count -> Order -> [Token] -> [Token]
-nestedInfoContent i k ts
-  | i < 1 = ts
-  | otherwise = nestedInfoContent (i - 1) k $ map tokenize $ segmentByBoundaryIC k ts
+nestedEntropy :: Depth -> Order -> [Token] -> [Token]
+nestedEntropy = nestedSegmentation segmentByBoundaryEntropy
+
+nestedInfoContent :: Depth -> Order -> [Token] -> [Token]
+nestedInfoContent = nestedSegmentation segmentByBoundaryIC
 
 --------------------------------------------------------------------------------
 -- Input
 
-evaluateText :: String -> IO ()
-evaluateText filename = do
+standardMapOf :: Order -> String -> IO ()
+standardMapOf k filename = do
   text <- readFile filename
-  (putStr . unlines . evaluate) text
+  let contents = unmarked text
+      fm = frequencyMap k contents
+      pm = prefixEntropyMap k contents
+      sm = suffixEntropyMap k contents
+      im = infixEntropyMap pm sm
+      standard = standardMap im fm
+  putStrLn $ show standard
 
-evaluate :: String -> [String]
-evaluate text = do
-  depth <- [9..10]
-  order <- [1..3]
+printUsingFile :: (String -> String) -> String -> IO ()
+printUsingFile f filename = do
+  text <- readFile filename
+  printUsingString f text
+
+printUsingString :: (String -> String) -> String -> IO ()
+printUsingString f s = do
+  print $ f s
+
+qualityForDepthsOrders :: String -> String
+qualityForDepthsOrders text = unlines $ do
+  d <- map Depth [1 .. 3]
+  k <- map Order [1 .. 3]
   let ground = groundTruth text
-      contents = preprocessText text
-      segments = nestedEntropy depth (Order order) contents
+      segments = nestedEntropy d k (unmarked text)
   return $
-    show depth ++ "\t" ++ show order ++ "\t" ++ show (quality ground segments)
+    show d ++ "\t" ++ show k ++ "\t" ++ show (quality ground segments)
 
-evaluateAtDepthOrder :: Integer -> Int -> String -> IO ()
-evaluateAtDepthOrder depth k filename = do
-  text <- readFile filename
-  let ground = groundTruth text
-      contents = preprocessText text
-      segments = nestedEntropy depth (Order k) contents
-  print $ quality ground segments
+segmentationWith :: ([Token] -> [Token]) -> String -> [Token]
+segmentationWith f text = f (unmarked text)
 
-nestedEntropyText :: Integer -> Int -> String -> IO ()
-nestedEntropyText depth k filename = do
-  text <- readFile filename
-  let contents = preprocessText text
-      segments = nestedEntropy depth (Order k) contents
-  print $ take 100 segments
-  return ()
+nestedEntropyText :: Depth -> Order -> String -> [Token]
+nestedEntropyText d k = segmentationWith (nestedEntropy d k)
 
-nestedInfoContentText :: Integer -> Int -> String -> IO ()
-nestedInfoContentText depth k fileName = do
-  text <- readFile fileName
-  let contents = preprocessText text
-      segments = nestedInfoContent depth (Order k) contents
-  print $ take 100 segments
-  return ()
+nestedInfoContentText :: Depth -> Order -> String -> [Token]
+nestedInfoContentText d k = segmentationWith (nestedInfoContent d k)
 
-segmentTextWithOrder :: Int -> String -> IO ()
-segmentTextWithOrder = nestedEntropyText 1
+runMultiple :: FileName -> IO ()
+runMultiple s = do
+  printUsingFile qualityForDepthsOrders s
 
-tokenChar :: Char -> Token
-tokenChar c = Token [c]
-
-preprocessText :: String -> [Token]
-preprocessText = map (tokenChar . toLower) . filter isLetter . filter isAscii
+runSegmentation :: FileName -> IO ()
+runSegmentation s = do
+  printUsingFile (show . take 100 . nestedEntropyText (Depth 1) (Order 1)) s
 
 --------------------------------------------------------------------------------
 -- Ground Truth
+
+unmarked :: String -> [Token]
+unmarked = map (tokenizeChar . toLower) . filter isLetter . filter isAscii
 
 groundTruth :: String -> [Token]
 groundTruth =
@@ -338,26 +394,9 @@ groundTruth =
 -- Since we're comparing sets, the direction of the scan doesn't actually matter
 -- Therefore, indices are counted from the end of the list to the front
 boundaryIndices :: [Token] -> Set.Set Int
-boundaryIndices ts = Set.fromDistinctDescList $
-  (tail . scanr1 (+) . map (\(Token t) -> genericLength t)) ts
-
-precision :: [Token] -> [Token] -> Double
-precision source target = fromIntegral correct / fromIntegral found
-  where
-    correct = Set.size $ boundaryIndices source `Set.intersection` boundaryIndices target
-    found = length target - 1
-
-recall :: [Token] -> [Token] -> Double
-recall source target = fromIntegral correct / fromIntegral total
-  where
-    correct = Set.size $ boundaryIndices source `Set.intersection` boundaryIndices target
-    total = length source - 1
-
-fmeasure :: [Token] -> [Token] -> Double
-fmeasure source target = 2 * p * r / (p + r)
-  where
-    p = precision source target
-    r = recall source target
+boundaryIndices ts =
+  Set.fromDistinctDescList $
+    (tail . scanr1 (+) . map (\(Token t) -> genericLength t)) ts
 
 quality :: [Token] -> [Token] -> Score
 quality source target = Score (p, r, f)
@@ -365,7 +404,9 @@ quality source target = Score (p, r, f)
     correct = Set.size $ boundaryIndices source `Set.intersection` boundaryIndices target
     found = length target - 1
     total = length source - 1
-    p = if found == 0 then 0 else
-      fromIntegral correct / fromIntegral found
+    p =
+      if found == 0
+        then 0
+        else fromIntegral correct / fromIntegral found
     r = fromIntegral correct / fromIntegral total
     f = 2 * p * r / (p + r)
