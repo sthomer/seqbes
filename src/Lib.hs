@@ -13,6 +13,7 @@ import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
 import Numeric
 import System.Environment
+import Data.HashMap.Lazy ((!))
 
 --------------------------------------------------------------------------------
 
@@ -36,6 +37,14 @@ instance Affix Suffix
 data Infix
 
 instance Affix Infix
+
+data Forward
+
+instance Affix Forward
+
+data Reverse
+
+instance Affix Reverse
 
 newtype EntropyMap a = EntropyMap (M.HashMap Context Entropy)
 
@@ -94,12 +103,12 @@ instance Show (InfoContentMap a) where
 instance Show (EntropyMap a) where
   show (EntropyMap em) = intercalate "\n" $ map showEntry $ sortOn snd (M.toList em)
     where
-      showEntry (t, n) = show t ++ ": " ++ showFFloat (Just 3) n ""
+      showEntry (t, n) = show t ++ ": " ++ showFFloat (Just 6) n ""
 
 instance Show FrequencyMap where
-  show (FrequencyMap em) = intercalate "\n" $ sort $ map showEntry (M.toList em)
+  show (FrequencyMap em) = intercalate "\n" $ map showEntry $ sort (M.toList em)
     where
-      showEntry (t, n) = show t ++ ": " ++ showFFloat (Just 3) (n * 100) ""
+      showEntry (t, n) = show t ++ ": " ++ showFFloat (Just 3) n ""
 
 instance (Show a) => Show (ContextMap a) where
   show (ContextMap cm) =
@@ -171,6 +180,12 @@ transitionMapWith split (Order k) = countTransitions split . windows (Order (k +
 suffixSplit :: Window -> (Token, Context)
 suffixSplit (Window ts) = (last ts, Context (init ts))
 
+forwardSplit :: Window -> (Token, Context)
+forwardSplit (Window ts) = (last ts, Context [head ts])
+
+reverseSplit :: Window -> (Token, Context)
+reverseSplit (Window ts) = (head ts, Context [last ts])
+
 prefixSplit :: Window -> (Token, Context)
 prefixSplit (Window ts) = (head ts, Context (tail ts))
 
@@ -193,10 +208,16 @@ frequencyMap k ts = FrequencyMap $ M.map (/ total) fs
     total = genericLength ts
 
 prefixEntropyMap :: Order -> [Token] -> EntropyMap Prefix
-prefixEntropyMap k = entropyMap . markovChain . prefixTransitionMap k
+prefixEntropyMap k = entropyMap . markovChain . transitionMapWith prefixSplit k
 
 suffixEntropyMap :: Order -> [Token] -> EntropyMap Suffix
-suffixEntropyMap k = entropyMap . markovChain . suffixTransitionMap k
+suffixEntropyMap k = entropyMap . markovChain . transitionMapWith suffixSplit k
+
+forwardEntropyMap :: Order -> [Token] -> EntropyMap Forward
+forwardEntropyMap k = entropyMap . markovChain . transitionMapWith forwardSplit k
+
+reverseEntropyMap :: Order -> [Token] -> EntropyMap Reverse
+reverseEntropyMap k = entropyMap . markovChain . transitionMapWith reverseSplit k
 
 infixEntropyMap :: EntropyMap Prefix -> EntropyMap Suffix -> EntropyMap Infix
 infixEntropyMap (EntropyMap pm) (EntropyMap sm) = EntropyMap $ M.unionWith (-) pm sm
@@ -312,7 +333,7 @@ icFold (Order k) bp (pm, sm) ts = snd $ foldr f initial (frames (Order (k + 1)) 
         isBoundary = unionBoundary isPrefixBoundary isSuffixBoundary
 
 segmentByBoundaryEntropy :: Order -> [Token] -> [Segment]
-segmentByBoundaryEntropy k ts = 
+segmentByBoundaryEntropy k ts =
   entropyFold k (BoundaryPolicy rise) (prefixEntropyMap k ts, suffixEntropyMap k ts) ts
 
 segmentByBoundaryIC :: Order -> [Token] -> [Segment]
@@ -335,6 +356,54 @@ nestedInfoContent = nestedSegmentation segmentByBoundaryIC
 --------------------------------------------------------------------------------
 -- Input
 
+aggregation :: Order -> FileName -> IO ()
+aggregation (Order k) filename = do
+  text <- readFile filename
+  let contents = unmarked text
+      (EntropyMap sm1) = suffixEntropyMap (Order 1) contents
+      (EntropyMap sm) = suffixEntropyMap (Order k) contents
+      (EntropyMap pm1) = prefixEntropyMap (Order 1) contents
+      (EntropyMap pm) = prefixEntropyMap (Order k) contents
+      (EntropyMap fm) = forwardEntropyMap (Order (k+1)) contents
+      (FrequencyMap cm1)= frequencyMap (Order 1) contents
+      (FrequencyMap cm2)= frequencyMap (Order (k+1)) contents
+      im = M.unionWith (-) sm pm
+
+      -- 1) H(C|AB) = H(C|B)
+      -- 2) H(C|AB) = H(C|B) - H(A|B) + H(B|A)
+      -- 3) H(C|AB) = H(C|B) - H(A|B) + H(C|A)
+      hm' = M.fromList [(Context (ka ++ kb), 0 + vb) |
+                        (Context ka, va) <- M.toList fm, --sm1
+                        (Context kb, vb) <- M.toList im] --sm
+      (EntropyMap hm) = suffixEntropyMap (Order (k+1)) contents
+
+      dm = M.intersectionWith (-) hm hm'
+      sem = M.map (^2) dm
+      aem = M.map abs dm
+      rms = sqrt $ sum $ M.elems $ M.intersectionWith (*) sem cm2
+      mae = sum $ M.elems $ M.intersectionWith (*) sem cm2
+      dm2 = M.intersectionWith (-) sm1 fm
+      sem2 = M.map (^2) dm2
+      aem2 = M.map abs dm2
+      rms2 = sqrt $ sum $ M.elems $ M.intersectionWith (*) sem2 cm1
+      mae2 = sum $ M.elems $ M.intersectionWith (*) aem2 cm1
+--  putStrLn $ "RMS Error: " ++ show rms
+--  putStrLn $ "MA Error: " ++ show mae
+--  putStrLn $ show (EntropyMap cm2)
+  putStrLn $ show $ hm ! Context (tokenizeString "ng")
+  putStrLn $ show $ hm ! Context (tokenizeString "th")
+  putStrLn $ show $ hm ! Context (tokenizeString "he")
+  putStrLn $ show $ hm ! Context (tokenizeString "in")
+  putStrLn $ show $ hm ! Context (tokenizeString "er")
+  putStrLn $ show $ hm ! Context (tokenizeString "an")
+  putStrLn ""
+  putStrLn $ show $ hm' ! Context (tokenizeString "ng")
+  putStrLn $ show $ hm' ! Context (tokenizeString "th")
+  putStrLn $ show $ hm' ! Context (tokenizeString "he")
+  putStrLn $ show $ hm' ! Context (tokenizeString "in")
+  putStrLn $ show $ hm' ! Context (tokenizeString "er")
+  putStrLn $ show $ hm' ! Context (tokenizeString "an")
+
 standardMapOf :: Order -> String -> IO ()
 standardMapOf k filename = do
   text <- readFile filename
@@ -344,6 +413,11 @@ standardMapOf k filename = do
       sm = suffixEntropyMap k contents
       im = infixEntropyMap pm sm
       standard = standardMap im fm
+  putStrLn "Prefix Entropy Map"
+  putStrLn $ show pm
+  putStrLn "Suffix Entropy Map"
+  putStrLn $ show sm
+  putStrLn "Standard Infix Entropy Map"
   putStrLn $ show standard
 
 printUsingFile :: (String -> String) -> String -> IO ()
