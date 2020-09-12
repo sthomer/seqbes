@@ -8,7 +8,7 @@ module Lib where
 import Data.Char
 import qualified Data.HashMap.Lazy as M
 import Data.Hashable
-import Data.List (genericLength, inits, intercalate, intersect, sort, sortOn, tails)
+import Data.List (genericLength, inits, intercalate, intersect, sort, sortOn, tails, elemIndex)
 import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
 import Numeric
@@ -103,7 +103,7 @@ instance Show (InfoContentMap a) where
 instance Show (EntropyMap a) where
   show (EntropyMap em) = intercalate "\n" $ map showEntry $ sortOn snd (M.toList em)
     where
-      showEntry (t, n) = show t ++ ": " ++ showFFloat (Just 6) n ""
+      showEntry (t, n) = show t ++ ": " ++ showFFloat (Just 3) n ""
 
 instance Show FrequencyMap where
   show (FrequencyMap em) = intercalate "\n" $ map showEntry $ sort (M.toList em)
@@ -207,6 +207,11 @@ frequencyMap k ts = FrequencyMap $ M.map (/ total) fs
     fs = (M.fromListWith (+) . map ((,1) . toContext)) (windows k ts)
     total = genericLength ts
 
+zeroMap :: [Token] -> FrequencyMap
+zeroMap ts = FrequencyMap $ M.map infoContent fm
+  where
+    (FrequencyMap fm) = frequencyMap (Order 1) ts
+
 prefixEntropyMap :: Order -> [Token] -> EntropyMap Prefix
 prefixEntropyMap k = entropyMap . markovChain . transitionMapWith prefixSplit k
 
@@ -304,19 +309,30 @@ contextPairs k (t : ts) = zip (contexts (t : ts)) (contexts ts)
   where
     contexts xs = map toContext $ windows k xs
 
-entropyFold :: Order -> BoundaryPolicy -> (EntropyMap Prefix, EntropyMap Suffix) -> [Token] -> [Segment]
+entropyFold ::
+  Order ->
+  BoundaryPolicy ->
+  (EntropyMap Prefix, EntropyMap Suffix) ->
+  [Token] ->
+  [Segment]
 entropyFold k bp (pm, sm) ts = snd $ foldr boundaryFrame initial $ frames k ts
   where
     initial = (Segment [], [])
-    boundaryFrame (Frame (t, suffixCxts, prefixCxts)) (Segment s, segments) = case isBoundary of
-      Boundary -> (Segment [t], Segment s : segments)
-      NoBoundary -> (Segment (t : s), segments)
-      where
-        isBoundary = unionBoundary isPrefixBoundary isSuffixBoundary
-        isPrefixBoundary = entropyBoundary bp pm prefixCxts
-        isSuffixBoundary = entropyBoundary bp sm suffixCxts
+    boundaryFrame (Frame (t, suffixCxts, prefixCxts)) (Segment s, segments) =
+      case isBoundary of
+        Boundary -> (Segment [t], Segment s : segments)
+        NoBoundary -> (Segment (t : s), segments)
+        where
+          isBoundary = unionBoundary isPrefixBoundary isSuffixBoundary
+          isPrefixBoundary = entropyBoundary bp pm prefixCxts
+          isSuffixBoundary = entropyBoundary bp sm suffixCxts
 
-icFold :: Order -> BoundaryPolicy -> (InfoContentMap Prefix, InfoContentMap Suffix) -> [Token] -> [Segment]
+icFold ::
+  Order ->
+  BoundaryPolicy ->
+  (InfoContentMap Prefix, InfoContentMap Suffix) ->
+  [Token] ->
+  [Segment]
 icFold (Order k) bp (pm, sm) ts = snd $ foldr f initial (frames (Order (k + 1)) ts)
   where
     initial = (Segment [], [])
@@ -356,53 +372,76 @@ nestedInfoContent = nestedSegmentation segmentByBoundaryIC
 --------------------------------------------------------------------------------
 -- Input
 
-aggregation :: Order -> FileName -> IO ()
-aggregation (Order k) filename = do
+---- TODO: Correct?
+--cmp :: EntropyMap a -> EntropyMap a -> Double
+--cmp (EntropyMap xm) (EntropyMap ym) = similar / total
+--  where
+--    total = sum [1 | xa <- M.keys xm, xb <- M.keys xm, xm ! xa /= xm ! xb]
+--    similar = sum [1 | xa <- M.keys xm, xb <- M.keys xm,
+--                       (xm ! xa < xm ! xb && ym ! xa < ym ! xb)
+--                       || (xm ! xa > xm ! xb && ym ! xa > ym ! xb)]
+
+inspiration :: FileName -> IO ()
+inspiration filename = do
   text <- readFile filename
   let contents = unmarked text
-      (EntropyMap sm1) = suffixEntropyMap (Order 1) contents
-      (EntropyMap sm) = suffixEntropyMap (Order k) contents
-      (EntropyMap pm1) = prefixEntropyMap (Order 1) contents
-      (EntropyMap pm) = prefixEntropyMap (Order k) contents
-      (EntropyMap fm) = forwardEntropyMap (Order (k+1)) contents
-      (FrequencyMap cm1)= frequencyMap (Order 1) contents
-      (FrequencyMap cm2)= frequencyMap (Order (k+1)) contents
-      im = M.unionWith (-) sm pm
-
-      -- 1) H(C|AB) = H(C|B)
-      -- 2) H(C|AB) = H(C|B) - H(A|B) + H(B|A)
-      -- 3) H(C|AB) = H(C|B) - H(A|B) + H(C|A)
-      hm' = M.fromList [(Context (ka ++ kb), 0 + vb) |
-                        (Context ka, va) <- M.toList fm, --sm1
-                        (Context kb, vb) <- M.toList im] --sm
-      (EntropyMap hm) = suffixEntropyMap (Order (k+1)) contents
-
+      (EntropyMap sm) = suffixEntropyMap (Order 1) contents
+      (EntropyMap pm) = prefixEntropyMap (Order 1) contents
+      (EntropyMap fm) = forwardEntropyMap (Order 2) contents
+      (EntropyMap hm) = suffixEntropyMap (Order 2) contents
+      (FrequencyMap cm) = frequencyMap (Order 2) contents
+      -- set bias to MS error of no bias
+      -- Siddhartha: 2.8675
+      -- Moby Dick: 3.0452
+      -- Ensemble: 3.0553
+      -- Little Women: 3.0214
+      hm'' = M.fromList [(Context (ksa ++ ksb), (1/3) * (sb + fa - pb - sa) + 0) |
+                        (Context ksb, sb) <- M.toList sm,
+                        (Context kpb, pb) <- M.toList pm,
+                        ksb == kpb,
+                        (Context kfa, fa) <- M.toList fm,
+                        (Context ksa, sa) <- M.toList sm,
+                        kfa == ksa]
+      hm' = M.intersection hm'' hm
       dm = M.intersectionWith (-) hm hm'
       sem = M.map (^2) dm
       aem = M.map abs dm
-      rms = sqrt $ sum $ M.elems $ M.intersectionWith (*) sem cm2
-      mae = sum $ M.elems $ M.intersectionWith (*) sem cm2
-      dm2 = M.intersectionWith (-) sm1 fm
-      sem2 = M.map (^2) dm2
-      aem2 = M.map abs dm2
-      rms2 = sqrt $ sum $ M.elems $ M.intersectionWith (*) sem2 cm1
-      mae2 = sum $ M.elems $ M.intersectionWith (*) aem2 cm1
+      mse = sum $ M.elems $ M.intersectionWith (*) dm cm
+      rms = sqrt $ sum $ M.elems $ M.intersectionWith (*) sem cm
+      mae = sum $ M.elems $ M.intersectionWith (*) aem cm
+--      sim = cmp (EntropyMap hm) (EntropyMap hm')
+  putStrLn $ "MS Error: " ++ show mse
+  putStrLn $ "RMS Error: " ++ show rms
+  putStrLn $ "MA Error: " ++ show mae
+--  putStrLn $ "Ordering: " ++ show sim
+--  putStrLn $ show (EntropyMap hm)
+--  putStrLn ""
+--  putStrLn $ show (EntropyMap hm')
+--  putStrLn $ show (EntropyMap dm)
+
+--aggregation (Order k) filename = do
+--  text <- readFile filename
+--  let contents = unmarked text
+--      (EntropyMap sm1) = suffixEntropyMap (Order 1) contents
+--      (EntropyMap sm) = suffixEntropyMap (Order k) contents
+--      (EntropyMap pm) = prefixEntropyMap (Order k) contents
+--      (EntropyMap fm) = forwardEntropyMap (Order (k+1)) contents
+--      (FrequencyMap cm)= frequencyMap (Order (k+1)) contents
+--      im = M.unionWith (-) sm pm
+--
+--      hm' = M.fromList [(Context (ka ++ kb), va + vb) |
+--                        (Context ka, va) <- M.toList fm, --sm1
+--                        (Context kb, vb) <- M.toList im] --sm
+--      (EntropyMap hm) = suffixEntropyMap (Order (k+1)) contents
+--
+--      dm = M.intersectionWith (-) hm hm'
+--      sem = M.map (^2) dm
+--      aem = M.map abs dm
+--      rms = sqrt $ sum $ M.elems $ M.intersectionWith (*) sem cm
+--      mae = sum $ M.elems $ M.intersectionWith (*) sem cm
 --  putStrLn $ "RMS Error: " ++ show rms
 --  putStrLn $ "MA Error: " ++ show mae
---  putStrLn $ show (EntropyMap cm2)
-  putStrLn $ show $ hm ! Context (tokenizeString "ng")
-  putStrLn $ show $ hm ! Context (tokenizeString "th")
-  putStrLn $ show $ hm ! Context (tokenizeString "he")
-  putStrLn $ show $ hm ! Context (tokenizeString "in")
-  putStrLn $ show $ hm ! Context (tokenizeString "er")
-  putStrLn $ show $ hm ! Context (tokenizeString "an")
-  putStrLn ""
-  putStrLn $ show $ hm' ! Context (tokenizeString "ng")
-  putStrLn $ show $ hm' ! Context (tokenizeString "th")
-  putStrLn $ show $ hm' ! Context (tokenizeString "he")
-  putStrLn $ show $ hm' ! Context (tokenizeString "in")
-  putStrLn $ show $ hm' ! Context (tokenizeString "er")
-  putStrLn $ show $ hm' ! Context (tokenizeString "an")
+--  putStrLn $ show (EntropyMap cm)
 
 standardMapOf :: Order -> String -> IO ()
 standardMapOf k filename = do
