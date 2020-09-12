@@ -381,38 +381,104 @@ nestedInfoContent = nestedSegmentation segmentByBoundaryIC
 --                       (xm ! xa < xm ! xb && ym ! xa < ym ! xb)
 --                       || (xm ! xa > xm ! xb && ym ! xa > ym ! xb)]
 
-inspiration :: FileName -> IO ()
-inspiration filename = do
+-- TODO: Test 3rd-order estimation against Markov estimation (Higher-orders?)
+
+difference :: FileName -> IO ()
+difference filename = do
   text <- readFile filename
   let contents = unmarked text
       (EntropyMap sm) = suffixEntropyMap (Order 1) contents
       (EntropyMap pm) = prefixEntropyMap (Order 1) contents
       (EntropyMap fm) = forwardEntropyMap (Order 2) contents
+      (FrequencyMap cm) = frequencyMap (Order 3) contents
       (EntropyMap hm) = suffixEntropyMap (Order 2) contents
-      (FrequencyMap cm) = frequencyMap (Order 2) contents
-      -- set bias to MS error of no bias
-      -- Siddhartha: 2.8675
-      -- Moby Dick: 3.0452
-      -- Ensemble: 3.0553
-      -- Little Women: 3.0214
-      hm'' = M.fromList [(Context (ksa ++ ksb), (1/3) * (sb + fa - pb - sa) + 0) |
+      
+      -- H(D|BC) - H(C|AB) approximately equals: 
+      --  = H(D|C) - H(C|B)
+      --  = (1/3)*[ H(D|B) - H(C|A) + H(D|C) - H(C|B) 
+      --          + H(B|A) - H(C|B) + H(A|B) - H(C|B) ]
+      --  = (1/3)*[ H(D|C) - H(C|B) + H(A|B) - H(B|C) ]
+
+      hmd' = M.fromList [(Context (ksa ++ ksb ++ ksc),
+                           (1 / 3) * (fb - fa + sc - sb + sa - sb + pb - pc)) |
+                            (Context kfa, fa) <- M.toList fm,
+                            (Context kfb, fb) <- M.toList fm,
+                            (Context ksc, sc) <- M.toList sm,
+                            (Context ksb, sb) <- M.toList sm,
+                            (Context ksa, sa) <- M.toList sm,
+                            kfa == ksa,
+                            kfb == ksb,
+                            (Context kpb, pb) <- M.toList pm,
+                            ksb == kpb,
+                            (Context kpc, pc) <- M.toList pm]
+      hmd'' = M.fromList [(Context (ksa ++ ksb ++ ksc),
+                            sc - sb ) |
+--                           (1 / 3) * (sc - sb + pb - pc)) | -- replacing fa,fb with sa,sb
+                            (Context ksc, sc) <- M.toList sm,
+                            (Context ksb, sb) <- M.toList sm,
+                            (Context kpb, pb) <- M.toList pm,
+                            ksb == kpb,
+                            (Context kpc, pc) <- M.toList pm,
+                            ksc == kpc,
+                            (Context ksa, sa) <- M.toList sm]
+      hm' = M.fromList [(Context (ksa ++ ksb), (1/3) * (sb + fa - pb - sa)) |
                         (Context ksb, sb) <- M.toList sm,
                         (Context kpb, pb) <- M.toList pm,
                         ksb == kpb,
                         (Context kfa, fa) <- M.toList fm,
                         (Context ksa, sa) <- M.toList sm,
                         kfa == ksa]
-      hm' = M.intersection hm'' hm
-      dm = M.intersectionWith (-) hm hm'
+      hm'd = M.fromList [(Context (a:b:c), bc - ab) |
+                          (Context (b:c), bc) <- M.toList hm',
+                          (Context (a:[b']), ab) <- M.toList hm',
+                          b == b']
+      hmd = M.fromList [(Context (a:b:c), bc - ab) |
+                          (Context (b:c), bc) <- M.toList hm,
+                          (Context (a:[b']), ab) <- M.toList hm,
+                          b == b']
+      dm = M.intersectionWith (-) hmd hm'd
       sem = M.map (^2) dm
       aem = M.map abs dm
       mse = sum $ M.elems $ M.intersectionWith (*) dm cm
       rms = sqrt $ sum $ M.elems $ M.intersectionWith (*) sem cm
       mae = sum $ M.elems $ M.intersectionWith (*) aem cm
---      sim = cmp (EntropyMap hm) (EntropyMap hm')
   putStrLn $ "MS Error: " ++ show mse
-  putStrLn $ "RMS Error: " ++ show rms
   putStrLn $ "MA Error: " ++ show mae
+  putStrLn $ "RMS Error: " ++ show rms
+--  putStrLn $ show $ EntropyMap hmd
+
+--inspiration :: FileName -> IO ()
+--inspiration filename = do
+--  text <- readFile filename
+--  let contents = unmarked text
+--      (EntropyMap sm) = suffixEntropyMap (Order 1) contents
+--      (EntropyMap pm) = prefixEntropyMap (Order 1) contents
+--      (EntropyMap fm) = forwardEntropyMap (Order 2) contents
+--      (EntropyMap hm) = suffixEntropyMap (Order 2) contents
+--      (FrequencyMap cm) = frequencyMap (Order 2) contents
+--      -- set bias to MS error of no bias
+--      -- Siddhartha: 2.8675
+--      -- Moby Dick: 3.0452
+--      -- Ensemble: 3.0553
+--      -- Little Women: 3.0214
+--      hm'' = M.fromList [(Context (ksa ++ ksb), (1/3) * (sb + fa - pb - sa) + 0) |
+--                        (Context ksb, sb) <- M.toList sm,
+--                        (Context kpb, pb) <- M.toList pm,
+--                        ksb == kpb,
+--                        (Context kfa, fa) <- M.toList fm,
+--                        (Context ksa, sa) <- M.toList sm,
+--                        kfa == ksa]
+--      hm' = M.intersection hm'' hm
+--      dm = M.intersectionWith (-) hm hm'
+--      sem = M.map (^2) dm
+--      aem = M.map abs dm
+--      mse = sum $ M.elems $ M.intersectionWith (*) dm cm
+--      rms = sqrt $ sum $ M.elems $ M.intersectionWith (*) sem cm
+--      mae = sum $ M.elems $ M.intersectionWith (*) aem cm
+--      sim = cmp (EntropyMap hm) (EntropyMap hm')
+--  putStrLn $ "MS Error: " ++ show mse
+--  putStrLn $ "RMS Error: " ++ show rms
+--  putStrLn $ "MA Error: " ++ show mae
 --  putStrLn $ "Ordering: " ++ show sim
 --  putStrLn $ show (EntropyMap hm)
 --  putStrLn ""
