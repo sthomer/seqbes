@@ -14,15 +14,44 @@ import qualified Data.Set as Set
 import Numeric
 import System.Environment
 import Data.HashMap.Lazy ((!))
+import Data.Ratio (numerator, denominator)
 
 --------------------------------------------------------------------------------
 
-newtype ContextMap a = ContextMap (M.HashMap Context (M.HashMap Token a))
+-- Conditional Entropy
 
--- Does not handle zeroth-order models
+type To = Integer
 
--- newtype ContextMap a = ContextMap (M.HashMap Context a)
--- newtype TokenMap a = TokenMap (M.HashMap Token a)
+type From = Integer
+
+type Scale = Rational
+
+data ConditionalEntropy = ConditionalEntropy To [From]
+
+data CombinationEntropy
+  = Base ConditionalEntropy
+  | Combination Scale [CombinationEntropy] [CombinationEntropy]
+
+subsets :: [a] -> [[a]]
+subsets xs = zipWith (++) front back
+  where
+    front = init $ inits xs
+    back = map tail (init $ tails xs)
+
+subsets' :: [a] -> [(a, [a])]
+subsets' xs = zip xs (subsets xs)
+
+decompose :: ConditionalEntropy -> CombinationEntropy
+decompose base@(ConditionalEntropy y [x]) = Base base -- stop at first-order
+decompose (ConditionalEntropy y xs) = Combination scale
+  (map decompose positives) (map decompose negatives)
+  where
+    scale = 1 / (genericLength xs + 1)
+    tcs = subsets' xs
+    positives = map (ConditionalEntropy y . snd) tcs
+    negatives = map (uncurry ConditionalEntropy) tcs
+
+-- Affixes
 
 class Affix a
 
@@ -46,6 +75,10 @@ data Reverse
 
 instance Affix Reverse
 
+-- Maps
+
+newtype ContextMap a = ContextMap (M.HashMap Context (M.HashMap Token a))
+
 newtype EntropyMap a = EntropyMap (M.HashMap Context Entropy)
 
 newtype InfoContentMap a = InfoContentMap (ContextMap InfoContent)
@@ -55,6 +88,12 @@ newtype MarkovChain a = MarkovChain (ContextMap Probability)
 newtype TransitionMap a = TransitionMap (ContextMap Count)
 
 newtype FrequencyMap = FrequencyMap (M.HashMap Context Probability)
+
+-- Does not handle zeroth-order models
+-- newtype ContextMap a = ContextMap (M.HashMap Context a)
+-- newtype TokenMap a = TokenMap (M.HashMap Token a)
+
+-- Elements
 
 newtype Token = Token String deriving (Eq, Hashable, Ord)
 
@@ -67,6 +106,8 @@ newtype Segment = Segment [Token]
 data Boundary = Boundary | NoBoundary
 
 newtype BoundaryPolicy = BoundaryPolicy (Entropy -> Entropy -> Boundary)
+
+-- Aliases
 
 newtype Order = Order Int
 
@@ -141,6 +182,19 @@ instance Show Order where
 
 instance Show Depth where
   show (Depth d) = show d
+
+instance Show ConditionalEntropy where
+  show (ConditionalEntropy y xs) =
+    "H(" ++ show y ++ "|" ++ intercalate "," (map show xs) ++ ")"
+
+-- TODO: Indentation
+instance Show CombinationEntropy where
+  show (Base x) = show x
+  show (Combination scale ps ns) =
+    "(" ++ show (numerator scale) ++ "/" ++ show (denominator scale) ++ ")[ "
+    ++ intercalate " + " (map show ps)
+    ++ concatMap ((" - " ++) . show) ns
+    ++ " ]"
 
 --------------------------------------------------------------------------------
 -- Construction
@@ -253,6 +307,10 @@ infoContent p
 
 entropy :: [Probability] -> Entropy
 entropy = sum . map (\p -> p * infoContent p)
+
+--------------------------------------------------------------------------------
+-- Aggregation
+
 
 --------------------------------------------------------------------------------
 -- Segmentation
@@ -373,14 +431,19 @@ nestedInfoContent = nestedSegmentation segmentByBoundaryIC
 -- Input
 
 ---- TODO: Correct?
---cmp :: EntropyMap a -> EntropyMap a -> Double
---cmp (EntropyMap xm) (EntropyMap ym) = similar / total
---  where
---    total = sum [1 | xa <- M.keys xm, xb <- M.keys xm, xm ! xa /= xm ! xb]
---    similar = sum [1 | xa <- M.keys xm, xb <- M.keys xm,
---                       (xm ! xa < xm ! xb && ym ! xa < ym ! xb)
---                       || (xm ! xa > xm ! xb && ym ! xa > ym ! xb)]
+cmpOrd :: EntropyMap a -> EntropyMap a -> Double
+cmpOrd (EntropyMap xm) (EntropyMap ym) = less / less_total
+  where
+    total = sum [1 | xa <- M.keys xm, xb <- M.keys xm, xm ! xa /= xm ! xb]
+    similar = sum [1 | xa <- M.keys xm, xb <- M.keys xm,
+                       (xm ! xa < xm ! xb && ym ! xa < ym ! xb)
+                       || (xm ! xa > xm ! xb && ym ! xa > ym ! xb)]
+    less = sum [1 | xa <- M.keys xm, xb <- M.keys xm,
+                    xm ! xa < xm ! xb, ym ! xa < ym ! xb]
+    less_total = sum [1 | xa <- M.keys xm, xb <- M.keys xm,
+                          xm ! xa < xm ! xb]
 
+-- TODO: Implement LA estimate for higher-order estimation
 -- TODO: Test 3rd-order estimation against Markov estimation (Higher-orders?)
 
 difference :: FileName -> IO ()
@@ -392,10 +455,10 @@ difference filename = do
       (EntropyMap fm) = forwardEntropyMap (Order 2) contents
       (FrequencyMap cm) = frequencyMap (Order 3) contents
       (EntropyMap hm) = suffixEntropyMap (Order 2) contents
-      
-      -- H(D|BC) - H(C|AB) approximately equals: 
+
+      -- H(D|BC) - H(C|AB) approximately equals:
       --  = H(D|C) - H(C|B)
-      --  = (1/3)*[ H(D|B) - H(C|A) + H(D|C) - H(C|B) 
+      --  = (1/3)*[ H(D|B) - H(C|A) + H(D|C) - H(C|B)
       --          + H(B|A) - H(C|B) + H(A|B) - H(C|B) ]
       --  = (1/3)*[ H(D|C) - H(C|B) + H(A|B) - H(B|C) ]
 
@@ -411,8 +474,12 @@ difference filename = do
                             (Context kpb, pb) <- M.toList pm,
                             ksb == kpb,
                             (Context kpc, pc) <- M.toList pm]
+      hm'' = M.fromList [(Context (ksa ++ ksb), sb) |
+                          (Context ksb, sb) <- M.toList sm,
+                          (Context ksa, sa) <- M.toList sm]
       hmd'' = M.fromList [(Context (ksa ++ ksb ++ ksc),
                             sc - sb ) |
+--                            (1/2) * (sc - sb + pb - pc)) |
 --                           (1 / 3) * (sc - sb + pb - pc)) | -- replacing fa,fb with sa,sb
                             (Context ksc, sc) <- M.toList sm,
                             (Context ksb, sb) <- M.toList sm,
@@ -421,7 +488,7 @@ difference filename = do
                             (Context kpc, pc) <- M.toList pm,
                             ksc == kpc,
                             (Context ksa, sa) <- M.toList sm]
-      hm' = M.fromList [(Context (ksa ++ ksb), (1/3) * (sb + fa - pb - sa)) |
+      hm' = M.fromList [(Context (ksa ++ ksb), (1/3) * (sb + fa - pb - sa) + 2.8675) |
                         (Context ksb, sb) <- M.toList sm,
                         (Context kpb, pb) <- M.toList pm,
                         ksb == kpb,
@@ -436,16 +503,18 @@ difference filename = do
                           (Context (b:c), bc) <- M.toList hm,
                           (Context (a:[b']), ab) <- M.toList hm,
                           b == b']
-      dm = M.intersectionWith (-) hmd hm'd
+      dm = M.intersectionWith (-) hmd hmd'
       sem = M.map (^2) dm
       aem = M.map abs dm
       mse = sum $ M.elems $ M.intersectionWith (*) dm cm
       rms = sqrt $ sum $ M.elems $ M.intersectionWith (*) sem cm
       mae = sum $ M.elems $ M.intersectionWith (*) aem cm
+      o = cmpOrd (EntropyMap hm) (EntropyMap hm')
   putStrLn $ "MS Error: " ++ show mse
   putStrLn $ "MA Error: " ++ show mae
   putStrLn $ "RMS Error: " ++ show rms
---  putStrLn $ show $ EntropyMap hmd
+--  putStrLn $ "Ordering: " ++ show o
+--  putStrLn $ show $ EntropyMap dm
 
 --inspiration :: FileName -> IO ()
 --inspiration filename = do
@@ -475,39 +544,15 @@ difference filename = do
 --      mse = sum $ M.elems $ M.intersectionWith (*) dm cm
 --      rms = sqrt $ sum $ M.elems $ M.intersectionWith (*) sem cm
 --      mae = sum $ M.elems $ M.intersectionWith (*) aem cm
---      sim = cmp (EntropyMap hm) (EntropyMap hm')
---  putStrLn $ "MS Error: " ++ show mse
---  putStrLn $ "RMS Error: " ++ show rms
---  putStrLn $ "MA Error: " ++ show mae
+--      sim = cmpOrd (EntropyMap hm) (EntropyMap hm'')
+----  putStrLn $ "MS Error: " ++ show mse
+----  putStrLn $ "RMS Error: " ++ show rms
+----  putStrLn $ "MA Error: " ++ show mae
 --  putStrLn $ "Ordering: " ++ show sim
---  putStrLn $ show (EntropyMap hm)
---  putStrLn ""
---  putStrLn $ show (EntropyMap hm')
---  putStrLn $ show (EntropyMap dm)
-
---aggregation (Order k) filename = do
---  text <- readFile filename
---  let contents = unmarked text
---      (EntropyMap sm1) = suffixEntropyMap (Order 1) contents
---      (EntropyMap sm) = suffixEntropyMap (Order k) contents
---      (EntropyMap pm) = prefixEntropyMap (Order k) contents
---      (EntropyMap fm) = forwardEntropyMap (Order (k+1)) contents
---      (FrequencyMap cm)= frequencyMap (Order (k+1)) contents
---      im = M.unionWith (-) sm pm
---
---      hm' = M.fromList [(Context (ka ++ kb), va + vb) |
---                        (Context ka, va) <- M.toList fm, --sm1
---                        (Context kb, vb) <- M.toList im] --sm
---      (EntropyMap hm) = suffixEntropyMap (Order (k+1)) contents
---
---      dm = M.intersectionWith (-) hm hm'
---      sem = M.map (^2) dm
---      aem = M.map abs dm
---      rms = sqrt $ sum $ M.elems $ M.intersectionWith (*) sem cm
---      mae = sum $ M.elems $ M.intersectionWith (*) sem cm
---  putStrLn $ "RMS Error: " ++ show rms
---  putStrLn $ "MA Error: " ++ show mae
---  putStrLn $ show (EntropyMap cm)
+----  putStrLn $ show (EntropyMap hm)
+----  putStrLn ""
+----  putStrLn $ show (EntropyMap hm')
+----  putStrLn $ show (EntropyMap dm)
 
 standardMapOf :: Order -> String -> IO ()
 standardMapOf k filename = do
