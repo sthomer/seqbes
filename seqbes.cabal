@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 4e73717a62c44a3d424640a05ca8b5d8b7f2733cd0b699a61eadf5f939c1dfef
+-- hash: 885904b926bd1d5e35fbf6341521aaf8c8c4b397ae141c831ceff0f690d28335
 
 name:           seqbes
 version:        0.1.0.0
@@ -40,6 +40,7 @@ library
     , containers
     , hashable
     , hspec
+    , ilist
     , scientific
     , unordered-containers
   default-language: Haskell2010
@@ -58,6 +59,7 @@ executable seqbes-exe
     , containers
     , hashable
     , hspec
+    , ilist
     , scientific
     , seqbes
     , unordered-containers
@@ -78,6 +80,7 @@ test-suite seqbes-test
     , containers
     , hashable
     , hspec
+    , ilist
     , scientific
     , seqbes
     , unordered-containers

@@ -3,4 +3,4 @@ module Main where
 import Lib
 
 main :: IO ()
-main = runMultiple "./data/moby-dick.txt"
+main = runMultiple (FileName "./data/moby-dick.txt")

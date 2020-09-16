@@ -1,113 +1,170 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE GADTSyntax #-}
+{-# LANGUAGE StandaloneDeriving #-}
 
 module Lib where
 
 --------------------------------------------------------------------------------
 
-import Data.Char
-import qualified Data.HashMap.Lazy as M
-import Data.Hashable
-import Data.List (genericLength, inits, intercalate, intersect, sort, sortOn, tails, elemIndex)
-import Data.Maybe (fromMaybe)
-import qualified Data.Set as Set
-import Numeric
-import System.Environment
+import Data.Char (isAscii, isLetter, isSpace, toLower)
 import Data.HashMap.Lazy ((!))
-import Data.Ratio (numerator, denominator)
+import qualified Data.HashMap.Lazy as M
+import Data.Hashable (Hashable)
+import Data.List (inits, intercalate, permutations, sortOn, tails)
+import Data.List.Index (deleteAt)
+import Data.Maybe (fromMaybe)
+import Data.Ratio (denominator, numerator)
+import qualified Data.Set as Set
+import Numeric (showFFloat)
 
 --------------------------------------------------------------------------------
+-- Types
 
--- Conditional Entropy
+-- Affixes and Entropy Expressions
 
-type To = Integer
+-- More general way of describing affixes
+-- Easy for first-order. How to generalize to longer contexts?  Offset from token!
+-- e.g. H(A|B) = [+1] = 1-prefix, H(B|A) = [-1] = suffix
+-- e.g. H(A|BC) = [+1,+2], H(B|AC) = [-1,+1], H(C|AB) = [-2,-1]
+-- e.g. H(B|ACDE) = [-1,+1,+2,+3]
 
-type From = Integer
+newtype Affix = Affix [Int] deriving (Show)
 
-type Scale = Rational
+data EntropyExpr
+  = Term {to :: Int, from :: [Int]}
+  | Sum {scale :: Rational, positive :: [EntropyExpr], negative :: [EntropyExpr]}
 
-data ConditionalEntropy = ConditionalEntropy To [From]
+-- General Maps
 
-data CombinationEntropy
-  = Base ConditionalEntropy
-  | Combination Scale [CombinationEntropy] [CombinationEntropy]
+--data ContextMap a b where
+--  ContextMap :: (Eq a, Hashable a) => M.HashMap (Context a) b -> ContextMap a b
+newtype ContextMap a b = ContextMap (M.HashMap (Context a) b)
 
-subsets :: [a] -> [[a]]
-subsets xs = zipWith (++) front back
-  where
-    front = init $ inits xs
-    back = map tail (init $ tails xs)
+instance (Show a, RealFloat b) => Show (ContextMap a b) where
+  show (ContextMap m) = intercalate "\n" s
+    where
+      s = map showEntry $ sortOn snd (M.toList m)
+      showEntry (t, n) = show t ++ ": " ++ showFFloat (Just 3) n ""
 
-subsets' :: [a] -> [(a, [a])]
-subsets' xs = zip xs (subsets xs)
+instance Functor (ContextMap a) where
+  fmap f (ContextMap m) = ContextMap $ fmap f m
 
-decompose :: ConditionalEntropy -> CombinationEntropy
-decompose base@(ConditionalEntropy y [x]) = Base base -- stop at first-order
-decompose (ConditionalEntropy y xs) = Combination scale
-  (map decompose positives) (map decompose negatives)
-  where
-    scale = 1 / (genericLength xs + 1)
-    tcs = subsets' xs
-    positives = map (ConditionalEntropy y . snd) tcs
-    negatives = map (uncurry ConditionalEntropy) tcs
+instance (Eq a, Hashable a) => Semigroup (ContextMap a b) where
+  (ContextMap x) <> (ContextMap y) = ContextMap $ x <> y
 
--- Affixes
+instance (Eq a, Hashable a) => Monoid (ContextMap a b) where
+  mempty = ContextMap M.empty
 
-class Affix a
+newtype ContextTokenMap a b = ContextTokenMap (ContextMap a (M.HashMap (Token a) b))
 
-data Prefix
+pattern ContextTokenMap' m = ContextTokenMap (ContextMap m)
 
-instance Affix Prefix
+instance (Show a, Show b) => Show (ContextTokenMap a b) where
+  show (ContextTokenMap' m) =
+    intercalate "\n" $ map showContexts (M.toList m)
+    where
+      showContexts (c, ts) = show c ++ ":\n" ++ showTokens ts
+      showTokens = intercalate "\n" . map showEntry . M.toList
+      showEntry (t, n) = "  " ++ show t ++ ": " ++ show n
 
-data Suffix
+instance Functor (ContextTokenMap a) where
+  fmap f (ContextTokenMap' m) = ContextTokenMap' $ fmap (fmap f) m
 
-instance Affix Suffix
+instance (Eq a, Hashable a) => Semigroup (ContextTokenMap a b) where
+  (ContextTokenMap x) <> (ContextTokenMap y) = ContextTokenMap $ x <> y
 
-data Infix
+instance (Eq a, Hashable a) => Monoid (ContextTokenMap a b) where
+  mempty = ContextTokenMap mempty
 
-instance Affix Infix
+data ACMap a b = ACMap Affix (ContextMap a b)
 
-data Forward
+pattern ACMap' x m = ACMap x (ContextMap m)
 
-instance Affix Forward
+instance Functor (ACMap a) where
+  fmap f (ACMap x m) = ACMap x (fmap f m)
 
-data Reverse
+instance (Eq a, Hashable a) => Semigroup (ACMap a b) where
+  -- take the left affix and ignore the right
+  (ACMap ax x) <> (ACMap ay y) = ACMap ax (x <> y)
 
-instance Affix Reverse
+instance (Eq a, Hashable a) => Monoid (ACMap a b) where
+  -- the empty affix might cause trouble with (<>)
+  mempty = ACMap (Affix []) mempty
 
--- Maps
+data ACTMap a b = ACTMap Affix (ContextTokenMap a b)
 
-newtype ContextMap a = ContextMap (M.HashMap Context (M.HashMap Token a))
+pattern ACTMap' x m = ACTMap x (ContextTokenMap' m)
 
-newtype EntropyMap a = EntropyMap (M.HashMap Context Entropy)
+instance (Eq a, Hashable a) => Semigroup (ACTMap a b) where
+  -- take the left affix and ignore the right
+  (ACTMap ax x) <> (ACTMap ay y) = ACTMap ax (x <> y)
 
-newtype InfoContentMap a = InfoContentMap (ContextMap InfoContent)
+instance (Eq a, Hashable a) => Monoid (ACTMap a b) where
+  -- the empty affix might cause trouble with (<>)
+  mempty = ACTMap (Affix []) mempty
 
-newtype MarkovChain a = MarkovChain (ContextMap Probability)
+instance Functor (ACTMap a) where
+  fmap f (ACTMap x m) = ACTMap x (fmap f m)
 
-newtype TransitionMap a = TransitionMap (ContextMap Count)
+-- Specific Maps
 
-newtype FrequencyMap = FrequencyMap (M.HashMap Context Probability)
+newtype EntropyMap a = EntropyMap (ACMap a Entropy)
 
--- Does not handle zeroth-order models
--- newtype ContextMap a = ContextMap (M.HashMap Context a)
--- newtype TokenMap a = TokenMap (M.HashMap Token a)
+pattern EntropyMap' x m = EntropyMap (ACMap' x m)
+
+newtype FrequencyMap a = FrequencyMap (ContextMap a Probability)
+
+pattern FrequencyMap' m = FrequencyMap (ContextMap m)
+
+newtype InfoContentMap a = InfoContentMap (ACTMap a InfoContent)
+
+pattern InfoContentMap' x m = InfoContentMap (ACTMap' x m)
+
+newtype ProbabilityMap a = ProbabilityMap (ACTMap a Probability)
+
+pattern ProbabilityMap' x m = ProbabilityMap (ACTMap' x m)
+
+newtype TransitionMap a = TransitionMap (ACTMap a Transition)
+
+pattern TransitionMap' x m = TransitionMap (ACTMap' x m)
 
 -- Elements
 
-newtype Token = Token String deriving (Eq, Hashable, Ord)
+newtype Token a = Token a deriving (Eq, Hashable, Ord)
 
-newtype Context = Context [Token] deriving (Eq, Hashable, Ord)
+instance (Monoid a) => Semigroup (Token a) where
+  (Token x) <> (Token y) = Token $ x <> y
 
-newtype Window = Window [Token]
+instance (Monoid a) => Monoid (Token a) where
+  mempty = Token mempty
 
-newtype Segment = Segment [Token]
+newtype Context a = Context [Token a] deriving (Eq, Hashable, Ord)
+
+instance (Monoid a) => Semigroup (Context a) where
+  (Context x) <> (Context y) = Context $ x <> y
+
+instance (Monoid a) => Monoid (Context a) where
+  mempty = Context mempty
+
+newtype Window a = Window [Token a]
+
+newtype Segment a = Segment [Token a]
+
+instance Semigroup (Segment a) where
+  (Segment xs) <> (Segment ys) = Segment $ xs ++ ys
+
+instance Monoid (Segment a) where
+  mempty = Segment []
 
 data Boundary = Boundary | NoBoundary
 
-newtype BoundaryPolicy = BoundaryPolicy (Entropy -> Entropy -> Boundary)
+newtype BoundaryPolicy a = BoundaryPolicy (a -> a -> Boundary)
 
--- Aliases
+-- Safe Aliases
 
 newtype Order = Order Int
 
@@ -115,62 +172,46 @@ newtype Depth = Depth Int
 
 newtype Count = Count Integer deriving (Num, Eq, Ord, Real, Show)
 
-newtype Frame = Frame (Token, (Context, Context), (Context, Context))
+newtype Frame a = Frame (Token a, (Context a, Context a), (Context a, Context a))
 
 newtype Score = Score (Double, Double, Double)
 
-type Probability = Double
+newtype Probability = Probability Double deriving (Num, Eq, Ord, Real, Show, Fractional)
 
-type Entropy = Double
+newtype Entropy = Entropy Double deriving (Num, Eq, Ord, Real, Show, Fractional, Floating)
 
-type InfoContent = Double
+newtype InfoContent = InfoContent Double deriving (Num, Eq, Ord, Real, Show)
 
-type Standard = Double
+newtype Transition = Transition Int deriving (Num, Eq, Ord, Real, Show)
 
-type FileName = String
+newtype FileName = FileName String
 
 --------------------------------------------------------------------------------
 -- Display
 
-instance Show (TransitionMap a) where
-  show (TransitionMap tm) = show tm
+instance (Show a) => Show (TransitionMap a) where
+  show (TransitionMap' x m) = show x ++ "\n" ++ show m
 
-instance Show (MarkovChain a) where
-  show (MarkovChain mc) = show mc
+instance (Show a) => Show (ProbabilityMap a) where
+  show (ProbabilityMap' x m) = show x ++ "\n" ++ show m
 
-instance Show (InfoContentMap a) where
-  show (InfoContentMap im) = show im
+instance (Show a) => Show (InfoContentMap a) where
+  show (InfoContentMap' x m) = show x ++ "\n" ++ show m
 
-instance Show (EntropyMap a) where
-  show (EntropyMap em) = intercalate "\n" $ map showEntry $ sortOn snd (M.toList em)
-    where
-      showEntry (t, n) = show t ++ ": " ++ showFFloat (Just 3) n ""
+instance (Show a) => Show (FrequencyMap a) where
+  show (FrequencyMap' m) = show m
 
-instance Show FrequencyMap where
-  show (FrequencyMap em) = intercalate "\n" $ map showEntry $ sort (M.toList em)
-    where
-      showEntry (t, n) = show t ++ ": " ++ showFFloat (Just 3) n ""
-
-instance (Show a) => Show (ContextMap a) where
-  show (ContextMap cm) =
-    intercalate "\n" $
-      map showMemories (M.toList cm)
-    where
-      showMemories (m, ts) = show m ++ ":\n" ++ showTokens ts
-      showTokens = intercalate "\n" . map showEntry . M.toList
-      showEntry (t, n) = "  " ++ show t ++ ": " ++ show n
-
-instance Show Window where
+instance (Show a) => Show (Window a) where
   show (Window w) = concatMap show w
 
-instance Show Context where
+instance (Show a) => Show (Context a) where
   show (Context ts) = concatMap show ts
 
-instance Show Segment where
+instance (Show a) => Show (Segment a) where
   show (Segment s) = concatMap show s
 
-instance Show Token where
-  show (Token t) = t
+instance (Show a) => Show (Token a) where
+  show (Token t) = show t
 
 instance Show Score where
   show (Score (p, r, f)) =
@@ -183,170 +224,186 @@ instance Show Order where
 instance Show Depth where
   show (Depth d) = show d
 
-instance Show ConditionalEntropy where
-  show (ConditionalEntropy y xs) =
-    "H(" ++ show y ++ "|" ++ intercalate "," (map show xs) ++ ")"
-
 -- TODO: Indentation
-instance Show CombinationEntropy where
-  show (Base x) = show x
-  show (Combination scale ps ns) =
+instance Show EntropyExpr where
+  show Term {to, from} =
+    "H(" ++ show to ++ "|" ++ intercalate "," (map show from) ++ ")"
+  show Sum {scale, positive, negative} =
     "(" ++ show (numerator scale) ++ "/" ++ show (denominator scale) ++ ")[ "
-    ++ intercalate " + " (map show ps)
-    ++ concatMap ((" - " ++) . show) ns
-    ++ " ]"
+      ++ intercalate " + " (map show positive)
+      ++ concatMap ((" - " ++) . show) negative
+      ++ " ]"
 
 --------------------------------------------------------------------------------
 -- Construction
 
-tokenize :: Segment -> Token
-tokenize (Segment ts) = Token $ concatMap (\(Token t) -> t) ts
+toAffix :: EntropyExpr -> Affix
+toAffix Term {to, from} = Affix $ map (\x -> x - to) from
 
-tokenizeString :: String -> [Token]
+mkH :: Int -> [Int] -> EntropyExpr
+mkH to from = Term {to, from}
+
+decompose :: EntropyExpr -> EntropyExpr
+decompose base@Term {from = [x]} = base -- hardcoded to stop at first-order
+decompose Term {to = y, from = xs} =
+  Sum {scale, positive = map decompose neg, negative = map decompose neg}
+  where
+    scale = 1 / ((fromIntegral . length) xs + 1)
+    tcs = (map (\(x : xs) -> (x, xs)) . permutations) xs
+    pos = map (\(_, from) -> Term {to = y, from}) tcs
+    neg = map (\(to, from) -> Term {to, from}) tcs
+
+tokenize :: (Monoid a) => Segment a -> Token a
+tokenize (Segment ts) = foldr1 (<>) ts
+
+tokenizeString :: String -> [Token String]
 tokenizeString = map (\c -> Token [c])
 
-tokenizeChar :: Char -> Token
+tokenizeChar :: Char -> Token String
 tokenizeChar c = Token [c]
 
-toContext :: Window -> Context
+toContext :: Window a -> Context a
 toContext (Window w) = Context w
 
-toWindow :: Context -> Window
+toWindow :: Context a -> Window a
 toWindow (Context c) = Window c
 
-windows :: Order -> [Token] -> [Window]
+windows :: Order -> [Token a] -> [Window a]
 windows (Order n) ts =
   map Window $
     (foldr (zipWith (:)) (repeat []) . take n . tails) ts
 
-increment :: (Token, Context) -> TransitionMap a -> TransitionMap a
-increment (tkn, cxt) (TransitionMap (ContextMap tm)) =
-  TransitionMap $
-    ContextMap $
-      M.insertWith (M.unionWith (+)) cxt (M.singleton tkn 1) tm
-
-countTransitions :: (Window -> (Token, Context)) -> [Window] -> TransitionMap a
-countTransitions split = foldr (increment . split) (TransitionMap $ ContextMap M.empty)
-
-transitionMapWith :: (Window -> (Token, Context)) -> Order -> [Token] -> TransitionMap a
-transitionMapWith split (Order k) = countTransitions split . windows (Order (k + 1))
-
-suffixSplit :: Window -> (Token, Context)
-suffixSplit (Window ts) = (last ts, Context (init ts))
-
-forwardSplit :: Window -> (Token, Context)
-forwardSplit (Window ts) = (last ts, Context [head ts])
-
-reverseSplit :: Window -> (Token, Context)
-reverseSplit (Window ts) = (head ts, Context [last ts])
-
-prefixSplit :: Window -> (Token, Context)
-prefixSplit (Window ts) = (head ts, Context (tail ts))
-
-prefixTransitionMap :: Order -> [Token] -> TransitionMap Prefix
-prefixTransitionMap = transitionMapWith prefixSplit
-
-suffixTransitionMap :: Order -> [Token] -> TransitionMap Suffix
-suffixTransitionMap = transitionMapWith suffixSplit
-
-markovChain :: TransitionMap a -> MarkovChain a
-markovChain (TransitionMap (ContextMap tm)) = MarkovChain $ ContextMap $ M.map asDist tm
+-- Assume Window size is matched to Affix indices and therefore the Token/Context
+affixSplit :: Affix -> Window a -> (Token a, Context a)
+affixSplit (Affix is) (Window ts) = (token, Context context)
   where
+    i = negate $ minimum (0 : is)
+    token = ts !! i
+    context = deleteAt i ts
+
+prefix :: Order -> Affix
+prefix (Order k) = Affix [1 .. k]
+
+suffix :: Order -> Affix
+suffix (Order k) = Affix [(- k) .. (-1)]
+
+forward :: Order -> Affix
+forward (Order k) = Affix [- k]
+
+increment :: (Eq a, Hashable a) => (Token a, Context a) -> TransitionMap a -> TransitionMap a
+increment (tkn, cxt) (TransitionMap' x m) = TransitionMap' x m'
+  where
+    m' = M.insertWith (M.unionWith (+)) cxt (M.singleton tkn 1) m
+
+countTransitions :: (Eq a, Hashable a) => Affix -> [Window a] -> TransitionMap a
+countTransitions affix =
+  foldr (increment . affixSplit affix) (TransitionMap' affix M.empty)
+
+transitionMap :: (Eq a, Hashable a) => Affix -> Order -> [Token a] -> TransitionMap a
+transitionMap affix (Order k) = countTransitions affix . windows (Order (k + 1))
+
+prefixTransitionMap :: (Eq a, Hashable a) => Order -> [Token a] -> TransitionMap a
+prefixTransitionMap k = transitionMap (prefix k) k
+
+prefixEntropyMap :: (Eq a, Hashable a) => Order -> [Token a] -> EntropyMap a
+prefixEntropyMap k = entropyMap . probabilityMap . prefixTransitionMap k
+
+suffixTransitionMap :: (Eq a, Hashable a) => Order -> [Token a] -> TransitionMap a
+suffixTransitionMap k = transitionMap (suffix k) k
+
+suffixEntropyMap :: (Eq a, Hashable a) => Order -> [Token a] -> EntropyMap a
+suffixEntropyMap k = entropyMap . probabilityMap . suffixTransitionMap k
+
+forwardTransitionMap :: (Eq a, Hashable a) => Order -> [Token a] -> TransitionMap a
+forwardTransitionMap k = transitionMap (forward k) k
+
+forwardEntropyMap :: (Eq a, Hashable a) => Order -> [Token a] -> EntropyMap a
+forwardEntropyMap k = entropyMap . probabilityMap . forwardTransitionMap k
+
+frequencyMap :: (Eq a, Hashable a) => Order -> [Token a] -> FrequencyMap a
+frequencyMap k ts = FrequencyMap' m
+  where
+    m = M.map (/ total) fs
+    fs = (M.fromListWith (+) . map ((,1) . toContext)) (windows k ts)
+    total = (fromIntegral . length) ts
+
+probabilityMap :: TransitionMap a -> ProbabilityMap a
+probabilityMap (TransitionMap' x m) = ProbabilityMap' x m'
+  where
+    m' = M.map asDist m
     asDist cxt = M.map ((/ total cxt) . realToFrac) cxt
     total = realToFrac . sum . M.elems
 
-frequencyMap :: Order -> [Token] -> FrequencyMap
-frequencyMap k ts = FrequencyMap $ M.map (/ total) fs
+entropyMap :: ProbabilityMap a -> EntropyMap a
+entropyMap (ProbabilityMap' x m) = EntropyMap' x m'
   where
-    fs = (M.fromListWith (+) . map ((,1) . toContext)) (windows k ts)
-    total = genericLength ts
+    m' = M.map (entropy . M.elems) m
 
-zeroMap :: [Token] -> FrequencyMap
-zeroMap ts = FrequencyMap $ M.map infoContent fm
+standardMap :: (Eq a, Hashable a) => EntropyMap a -> FrequencyMap a -> EntropyMap a
+standardMap (EntropyMap' x em) (FrequencyMap' fm) = EntropyMap' x m'
   where
-    (FrequencyMap fm) = frequencyMap (Order 1) ts
-
-prefixEntropyMap :: Order -> [Token] -> EntropyMap Prefix
-prefixEntropyMap k = entropyMap . markovChain . transitionMapWith prefixSplit k
-
-suffixEntropyMap :: Order -> [Token] -> EntropyMap Suffix
-suffixEntropyMap k = entropyMap . markovChain . transitionMapWith suffixSplit k
-
-forwardEntropyMap :: Order -> [Token] -> EntropyMap Forward
-forwardEntropyMap k = entropyMap . markovChain . transitionMapWith forwardSplit k
-
-reverseEntropyMap :: Order -> [Token] -> EntropyMap Reverse
-reverseEntropyMap k = entropyMap . markovChain . transitionMapWith reverseSplit k
-
-infixEntropyMap :: EntropyMap Prefix -> EntropyMap Suffix -> EntropyMap Infix
-infixEntropyMap (EntropyMap pm) (EntropyMap sm) = EntropyMap $ M.unionWith (-) pm sm
-
-entropyMap :: MarkovChain a -> EntropyMap a
-entropyMap (MarkovChain (ContextMap mc)) = EntropyMap $ M.map (entropy . M.elems) mc
-
-standardMap :: EntropyMap a -> FrequencyMap -> EntropyMap a
-standardMap (EntropyMap em) (FrequencyMap fm) = EntropyMap $ M.map standardize em
-  where
-    mean = sum $ M.elems $ M.unionWith (*) em fm
-    sd = sqrt $ sum $ M.elems $ M.unionWith (*) fm (M.map (\e -> (e - mean) ^ 2) em)
+    m' = M.map standardize em
+    fme = M.map (\(Probability x) -> Entropy x) fm -- there's gotta be a better way
+    mean = sum $ M.elems $ M.unionWith (*) em fme
+    sd = sqrt $ sum $ M.elems $ M.unionWith (*) fme (M.map (\e -> (e - mean) ^ 2) em)
     standardize e = (e - mean) / sd
 
-infoContentMap :: MarkovChain a -> InfoContentMap a
-infoContentMap (MarkovChain (ContextMap mc)) =
-  InfoContentMap $
-    ContextMap $
-      M.map asInfoContent mc
+infoContentMap :: ProbabilityMap a -> InfoContentMap a
+infoContentMap (ProbabilityMap' x m) = InfoContentMap' x m'
   where
     asInfoContent = M.map infoContent
+    m' = M.map asInfoContent m
 
 infoContent :: Probability -> InfoContent
-infoContent p
-  | p == 0 = 0
-  | p == 1 = 0
-  | otherwise = (negate . logBase 2) p
+infoContent (Probability p)
+  | p == 0 = InfoContent 0
+  | p == 1 = InfoContent 0
+  | otherwise = InfoContent $ (negate . logBase 2) p
 
 entropy :: [Probability] -> Entropy
-entropy = sum . map (\p -> p * infoContent p)
+entropy = toEntropy . sum . map weight
+  where
+    weight (Probability p) = InfoContent p * infoContent (Probability p)
+    toEntropy (InfoContent e) = Entropy e
 
 --------------------------------------------------------------------------------
 -- Aggregation
 
-
 --------------------------------------------------------------------------------
 -- Segmentation
 
-rise :: Entropy -> Entropy -> Boundary
+rise :: (Ord a) => a -> a -> Boundary
 rise x y
   | x < y = Boundary
   | otherwise = NoBoundary
 
-entropyBoundary :: BoundaryPolicy -> EntropyMap a -> (Context, Context) -> Boundary
-entropyBoundary (BoundaryPolicy bp) (EntropyMap em) (cxtA, cxtB)
+entropyBoundary :: (Eq a, Hashable a) => BoundaryPolicy Entropy -> EntropyMap a -> (Context a, Context a) -> Boundary
+entropyBoundary (BoundaryPolicy bp) (EntropyMap' x m) (cxtA, cxtB)
   | (cxtA, cxtB) == (Context [], Context []) = Boundary -- Hack
   | otherwise = fromMaybe NoBoundary $
     do
-      entropyA <- M.lookup cxtA em
-      entropyB <- M.lookup cxtB em
+      entropyA <- M.lookup cxtA m
+      entropyB <- M.lookup cxtB m
       pure $ entropyA `bp` entropyB
 
-icBoundary :: BoundaryPolicy -> InfoContentMap a -> ((Token, Context), (Token, Context)) -> Boundary
-icBoundary (BoundaryPolicy bp) (InfoContentMap (ContextMap im)) ((tknA, cxtA), (tknB, cxtB)) =
+icBoundary :: (Eq a, Hashable a) => BoundaryPolicy InfoContent -> InfoContentMap a -> ((Token a, Context a), (Token a, Context a)) -> Boundary
+icBoundary (BoundaryPolicy bp) (InfoContentMap' x m) ((tknA, cxtA), (tknB, cxtB)) =
   fromMaybe NoBoundary $ do
-    imA <- M.lookup cxtA im
-    icA <- M.lookup tknA imA
-    imB <- M.lookup cxtB im
-    icB <- M.lookup tknB imB
-    pure $ icA `bp` icB
+    mA <- M.lookup cxtA m
+    icA <- M.lookup tknA mA
+    mB <- M.lookup cxtB m
+    icB <- M.lookup tknB mB
+    return $ icA `bp` icB
 
 unionBoundary :: Boundary -> Boundary -> Boundary
 unionBoundary NoBoundary NoBoundary = NoBoundary
 unionBoundary _ Boundary = Boundary
 unionBoundary Boundary _ = Boundary
 
-emptyFrame :: Frame
-emptyFrame = Frame (Token [], (Context [], Context []), (Context [], Context []))
+emptyFrame :: (Monoid a) => Frame a
+emptyFrame = Frame (mempty, (mempty, mempty), (mempty, mempty))
 
-frames :: Order -> [Token] -> [Frame]
+frames :: (Monoid a) => Order -> [Token a] -> [Frame a]
 frames (Order k) ts =
   emptyFrame :
   map
@@ -362,17 +419,18 @@ frames (Order k) ts =
     (y : ys) = (reverse . take (k + 1) . map (Context . reverse) . inits . reverse) ts
     ends = zip (y : ys) ys
 
-contextPairs :: Order -> [Token] -> [(Context, Context)]
+contextPairs :: Order -> [Token a] -> [(Context a, Context a)]
 contextPairs k (t : ts) = zip (contexts (t : ts)) (contexts ts)
   where
     contexts xs = map toContext $ windows k xs
 
 entropyFold ::
+  (Eq a, Hashable a, Monoid a) =>
   Order ->
-  BoundaryPolicy ->
-  (EntropyMap Prefix, EntropyMap Suffix) ->
-  [Token] ->
-  [Segment]
+  BoundaryPolicy Entropy ->
+  (EntropyMap a, EntropyMap a) ->
+  [Token a] ->
+  [Segment a]
 entropyFold k bp (pm, sm) ts = snd $ foldr boundaryFrame initial $ frames k ts
   where
     initial = (Segment [], [])
@@ -380,81 +438,87 @@ entropyFold k bp (pm, sm) ts = snd $ foldr boundaryFrame initial $ frames k ts
       case isBoundary of
         Boundary -> (Segment [t], Segment s : segments)
         NoBoundary -> (Segment (t : s), segments)
-        where
-          isBoundary = unionBoundary isPrefixBoundary isSuffixBoundary
-          isPrefixBoundary = entropyBoundary bp pm prefixCxts
-          isSuffixBoundary = entropyBoundary bp sm suffixCxts
-
-icFold ::
-  Order ->
-  BoundaryPolicy ->
-  (InfoContentMap Prefix, InfoContentMap Suffix) ->
-  [Token] ->
-  [Segment]
-icFold (Order k) bp (pm, sm) ts = snd $ foldr f initial (frames (Order (k + 1)) ts)
-  where
-    initial = (Segment [], [])
-    f (Frame (t', suffixWs, prefixWs)) (Segment s, segments) = case isBoundary of
-      Boundary -> (Segment [t'], Segment s : segments)
-      NoBoundary -> (Segment (t' : s), segments)
       where
-        (pa, pb) = prefixWs
-        (sa, sb) = suffixWs
-        prefixTknCxts = (prefixSplit (toWindow pa), prefixSplit (toWindow pb))
-        suffixTknCxts = (suffixSplit (toWindow sa), suffixSplit (toWindow sb))
-        isPrefixBoundary = icBoundary bp pm prefixTknCxts
-        isSuffixBoundary = icBoundary bp sm suffixTknCxts
         isBoundary = unionBoundary isPrefixBoundary isSuffixBoundary
+        isPrefixBoundary = entropyBoundary bp pm prefixCxts
+        isSuffixBoundary = entropyBoundary bp sm suffixCxts
 
-segmentByBoundaryEntropy :: Order -> [Token] -> [Segment]
+segmentByBoundaryEntropy :: (Eq a, Hashable a, Monoid a) => Order -> [Token a] -> [Segment a]
 segmentByBoundaryEntropy k ts =
   entropyFold k (BoundaryPolicy rise) (prefixEntropyMap k ts, suffixEntropyMap k ts) ts
 
-segmentByBoundaryIC :: Order -> [Token] -> [Segment]
-segmentByBoundaryIC k ts = icFold k (BoundaryPolicy rise) (pm ts, sm ts) ts
-  where
-    pm = infoContentMap . markovChain . prefixTransitionMap k
-    sm = infoContentMap . markovChain . suffixTransitionMap k
+--icFold ::
+--  Order ->
+--  BoundaryPolicy InfoContent ->
+--  (InfoContentMap a, InfoContentMap a) ->
+--  [Token a] ->
+--  [Segment a]
+--icFold (Order k) bp (pm, sm) ts = snd $ foldr f initial (frames (Order (k + 1)) ts)
+--  where
+--    initial = (Segment [], [])
+--    f (Frame (t', suffixWs, prefixWs)) (Segment s, segments) = case isBoundary of
+--      Boundary -> (Segment [t'], Segment s : segments)
+--      NoBoundary -> (Segment (t' : s), segments)
+--      where
+--        (pa, pb) = prefixWs
+--        (sa, sb) = suffixWs
+--        prefixTknCxts = (prefixSplit (toWindow pa), prefixSplit (toWindow pb))
+--        suffixTknCxts = (suffixSplit (toWindow sa), suffixSplit (toWindow sb))
+--        isPrefixBoundary = icBoundary bp pm prefixTknCxts
+--        isSuffixBoundary = icBoundary bp sm suffixTknCxts
+--        isBoundary = unionBoundary isPrefixBoundary isSuffixBoundary
 
-nestedSegmentation :: (Order -> [Token] -> [Segment]) -> Depth -> Order -> [Token] -> [Token]
+--segmentByBoundaryIC :: Order -> [Token a] -> [Segment a]
+--segmentByBoundaryIC k ts = icFold k (BoundaryPolicy rise) (pm ts, sm ts) ts
+--  where
+--    pm = infoContentMap . probabilityMap . prefixTransitionMap k
+--    sm = infoContentMap . probabilityMap . suffixTransitionMap k
+
+nestedSegmentation :: (Monoid a) => (Order -> [Token a] -> [Segment a]) -> Depth -> Order -> [Token a] -> [Token a]
 nestedSegmentation f (Depth d) k ts
   | d < 1 = ts
   | otherwise = nestedSegmentation f (Depth (d - 1)) k $ map tokenize $ f k ts
 
-nestedEntropy :: Depth -> Order -> [Token] -> [Token]
+nestedEntropy :: (Eq a, Hashable a, Monoid a) => Depth -> Order -> [Token a] -> [Token a]
 nestedEntropy = nestedSegmentation segmentByBoundaryEntropy
 
-nestedInfoContent :: Depth -> Order -> [Token] -> [Token]
-nestedInfoContent = nestedSegmentation segmentByBoundaryIC
+--nestedInfoContent :: Depth -> Order -> [Token a] -> [Token a]
+--nestedInfoContent = nestedSegmentation segmentByBoundaryIC
 
 --------------------------------------------------------------------------------
 -- Input
 
 ---- TODO: Correct?
-cmpOrd :: EntropyMap a -> EntropyMap a -> Double
-cmpOrd (EntropyMap xm) (EntropyMap ym) = less / less_total
+cmpOrd :: (Eq a, Hashable a) => EntropyMap a -> EntropyMap a -> Double
+cmpOrd (EntropyMap' _ xm) (EntropyMap' _ ym) = less / less_total
   where
     total = sum [1 | xa <- M.keys xm, xb <- M.keys xm, xm ! xa /= xm ! xb]
-    similar = sum [1 | xa <- M.keys xm, xb <- M.keys xm,
-                       (xm ! xa < xm ! xb && ym ! xa < ym ! xb)
-                       || (xm ! xa > xm ! xb && ym ! xa > ym ! xb)]
-    less = sum [1 | xa <- M.keys xm, xb <- M.keys xm,
-                    xm ! xa < xm ! xb, ym ! xa < ym ! xb]
-    less_total = sum [1 | xa <- M.keys xm, xb <- M.keys xm,
-                          xm ! xa < xm ! xb]
+    similar =
+      sum
+        [ 1 | xa <- M.keys xm, xb <- M.keys xm, (xm ! xa < xm ! xb && ym ! xa < ym ! xb)
+                                                  || (xm ! xa > xm ! xb && ym ! xa > ym ! xb)
+        ]
+    less =
+      sum
+        [ 1 | xa <- M.keys xm, xb <- M.keys xm, xm ! xa < xm ! xb, ym ! xa < ym ! xb
+        ]
+    less_total =
+      sum
+        [ 1 | xa <- M.keys xm, xb <- M.keys xm, xm ! xa < xm ! xb
+        ]
 
 -- TODO: Implement LA estimate for higher-order estimation
 -- TODO: Test 3rd-order estimation against Markov estimation (Higher-orders?)
 
 difference :: FileName -> IO ()
-difference filename = do
+difference (FileName filename) = do
   text <- readFile filename
   let contents = unmarked text
-      (EntropyMap sm) = suffixEntropyMap (Order 1) contents
-      (EntropyMap pm) = prefixEntropyMap (Order 1) contents
-      (EntropyMap fm) = forwardEntropyMap (Order 2) contents
-      (FrequencyMap cm) = frequencyMap (Order 3) contents
-      (EntropyMap hm) = suffixEntropyMap (Order 2) contents
+      (EntropyMap' _ sm) = suffixEntropyMap (Order 1) contents
+      (EntropyMap' _ pm) = prefixEntropyMap (Order 1) contents
+      (EntropyMap' _ fm) = forwardEntropyMap (Order 2) contents
+      (FrequencyMap' cm) = frequencyMap (Order 3) contents
+      (EntropyMap' _ hm) = suffixEntropyMap (Order 2) contents
 
       -- H(D|BC) - H(C|AB) approximately equals:
       --  = H(D|C) - H(C|B)
@@ -462,57 +526,78 @@ difference filename = do
       --          + H(B|A) - H(C|B) + H(A|B) - H(C|B) ]
       --  = (1/3)*[ H(D|C) - H(C|B) + H(A|B) - H(B|C) ]
 
-      hmd' = M.fromList [(Context (ksa ++ ksb ++ ksc),
-                           (1 / 3) * (fb - fa + sc - sb + sa - sb + pb - pc)) |
-                            (Context kfa, fa) <- M.toList fm,
-                            (Context kfb, fb) <- M.toList fm,
-                            (Context ksc, sc) <- M.toList sm,
-                            (Context ksb, sb) <- M.toList sm,
-                            (Context ksa, sa) <- M.toList sm,
-                            kfa == ksa,
-                            kfb == ksb,
-                            (Context kpb, pb) <- M.toList pm,
-                            ksb == kpb,
-                            (Context kpc, pc) <- M.toList pm]
-      hm'' = M.fromList [(Context (ksa ++ ksb), sb) |
-                          (Context ksb, sb) <- M.toList sm,
-                          (Context ksa, sa) <- M.toList sm]
-      hmd'' = M.fromList [(Context (ksa ++ ksb ++ ksc),
-                            sc - sb ) |
---                            (1/2) * (sc - sb + pb - pc)) |
---                           (1 / 3) * (sc - sb + pb - pc)) | -- replacing fa,fb with sa,sb
-                            (Context ksc, sc) <- M.toList sm,
-                            (Context ksb, sb) <- M.toList sm,
-                            (Context kpb, pb) <- M.toList pm,
-                            ksb == kpb,
-                            (Context kpc, pc) <- M.toList pm,
-                            ksc == kpc,
-                            (Context ksa, sa) <- M.toList sm]
-      hm' = M.fromList [(Context (ksa ++ ksb), (1/3) * (sb + fa - pb - sa) + 2.8675) |
-                        (Context ksb, sb) <- M.toList sm,
-                        (Context kpb, pb) <- M.toList pm,
-                        ksb == kpb,
-                        (Context kfa, fa) <- M.toList fm,
-                        (Context ksa, sa) <- M.toList sm,
-                        kfa == ksa]
-      hm'd = M.fromList [(Context (a:b:c), bc - ab) |
-                          (Context (b:c), bc) <- M.toList hm',
-                          (Context (a:[b']), ab) <- M.toList hm',
-                          b == b']
-      hmd = M.fromList [(Context (a:b:c), bc - ab) |
-                          (Context (b:c), bc) <- M.toList hm,
-                          (Context (a:[b']), ab) <- M.toList hm,
-                          b == b']
+      hmd' =
+        M.fromList
+          [ ( Context (ksa ++ ksb ++ ksc),
+              (1 / 3) * (fb - fa + sc - sb + sa - sb + pb - pc)
+            )
+            | (Context kfa, fa) <- M.toList fm,
+              (Context kfb, fb) <- M.toList fm,
+              (Context ksc, sc) <- M.toList sm,
+              (Context ksb, sb) <- M.toList sm,
+              (Context ksa, sa) <- M.toList sm,
+              kfa == ksa,
+              kfb == ksb,
+              (Context kpb, pb) <- M.toList pm,
+              ksb == kpb,
+              (Context kpc, pc) <- M.toList pm
+          ]
+      hm'' =
+        M.fromList
+          [ (Context (ksa ++ ksb), sb)
+            | (Context ksb, sb) <- M.toList sm,
+              (Context ksa, sa) <- M.toList sm
+          ]
+      hmd'' =
+        M.fromList
+          [ ( Context (ksa ++ ksb ++ ksc),
+              sc - sb
+            )
+            | --                            (1/2) * (sc - sb + pb - pc)) |
+              --                           (1 / 3) * (sc - sb + pb - pc)) | -- replacing fa,fb with sa,sb
+              (Context ksc, sc) <- M.toList sm,
+              (Context ksb, sb) <- M.toList sm,
+              (Context kpb, pb) <- M.toList pm,
+              ksb == kpb,
+              (Context kpc, pc) <- M.toList pm,
+              ksc == kpc,
+              (Context ksa, sa) <- M.toList sm
+          ]
+      hm' =
+        M.fromList
+          [ (Context (ksa ++ ksb), (1 / 3) * (sb + fa - pb - sa) + 2.8675)
+            | (Context ksb, sb) <- M.toList sm,
+              (Context kpb, pb) <- M.toList pm,
+              ksb == kpb,
+              (Context kfa, fa) <- M.toList fm,
+              (Context ksa, sa) <- M.toList sm,
+              kfa == ksa
+          ]
+      hm'd =
+        M.fromList
+          [ (Context (a : b : c), bc - ab)
+            | (Context (b : c), bc) <- M.toList hm',
+              (Context (a : [b']), ab) <- M.toList hm',
+              b == b'
+          ]
+      hmd =
+        M.fromList
+          [ (Context (a : b : c), bc - ab)
+            | (Context (b : c), bc) <- M.toList hm,
+              (Context (a : [b']), ab) <- M.toList hm,
+              b == b'
+          ]
       dm = M.intersectionWith (-) hmd hmd'
-      sem = M.map (^2) dm
+      sem = M.map (^ 2) dm
       aem = M.map abs dm
-      mse = sum $ M.elems $ M.intersectionWith (*) dm cm
-      rms = sqrt $ sum $ M.elems $ M.intersectionWith (*) sem cm
-      mae = sum $ M.elems $ M.intersectionWith (*) aem cm
-      o = cmpOrd (EntropyMap hm) (EntropyMap hm')
+      mse = sum $ M.elems $ M.intersectionWith (*) dm (M.map (\(Probability p) -> Entropy p) cm)
+      rms = sqrt $ sum $ M.elems $ M.intersectionWith (*) sem (M.map (\(Probability p) -> Entropy p) cm)
+      mae = sum $ M.elems $ M.intersectionWith (*) aem (M.map (\(Probability p) -> Entropy p) cm)
+      o = cmpOrd (EntropyMap' (Affix []) hm) (EntropyMap' (Affix []) hm')
   putStrLn $ "MS Error: " ++ show mse
   putStrLn $ "MA Error: " ++ show mae
   putStrLn $ "RMS Error: " ++ show rms
+
 --  putStrLn $ "Ordering: " ++ show o
 --  putStrLn $ show $ EntropyMap dm
 
@@ -554,21 +639,21 @@ difference filename = do
 ----  putStrLn $ show (EntropyMap hm')
 ----  putStrLn $ show (EntropyMap dm)
 
-standardMapOf :: Order -> String -> IO ()
-standardMapOf k filename = do
-  text <- readFile filename
-  let contents = unmarked text
-      fm = frequencyMap k contents
-      pm = prefixEntropyMap k contents
-      sm = suffixEntropyMap k contents
-      im = infixEntropyMap pm sm
-      standard = standardMap im fm
-  putStrLn "Prefix Entropy Map"
-  putStrLn $ show pm
-  putStrLn "Suffix Entropy Map"
-  putStrLn $ show sm
-  putStrLn "Standard Infix Entropy Map"
-  putStrLn $ show standard
+--standardMapOf :: Order -> String -> IO ()
+--standardMapOf k filename = do
+--  text <- readFile filename
+--  let contents = unmarked text
+--      fm = frequencyMap k contents
+--      pm = prefixEntropyMap k contents
+--      sm = suffixEntropyMap k contents
+--      im = infixEntropyMap pm sm
+--      standard = standardMap im fm
+--  putStrLn "Prefix Entropy Map"
+--  putStrLn $ show pm
+--  putStrLn "Suffix Entropy Map"
+--  putStrLn $ show sm
+--  putStrLn "Standard Infix Entropy Map"
+--  putStrLn $ show standard
 
 printUsingFile :: (String -> String) -> String -> IO ()
 printUsingFile f filename = do
@@ -588,41 +673,41 @@ qualityForDepthsOrders text = unlines $ do
   return $
     show d ++ "\t" ++ show k ++ "\t" ++ show (quality ground segments)
 
-segmentationWith :: ([Token] -> [Token]) -> String -> [Token]
+segmentationWith :: ([Token String] -> [Token String]) -> String -> [Token String]
 segmentationWith f text = f (unmarked text)
 
-nestedEntropyText :: Depth -> Order -> String -> [Token]
+nestedEntropyText :: Depth -> Order -> String -> [Token String]
 nestedEntropyText d k = segmentationWith (nestedEntropy d k)
 
-nestedInfoContentText :: Depth -> Order -> String -> [Token]
-nestedInfoContentText d k = segmentationWith (nestedInfoContent d k)
+--nestedInfoContentText :: Depth -> Order -> String -> [Token String]
+--nestedInfoContentText d k = segmentationWith (nestedInfoContent d k)
 
 runMultiple :: FileName -> IO ()
-runMultiple s = do
+runMultiple (FileName s) = do
   printUsingFile qualityForDepthsOrders s
 
 runSegmentation :: FileName -> IO ()
-runSegmentation s = do
+runSegmentation (FileName s) = do
   printUsingFile (show . take 100 . nestedEntropyText (Depth 1) (Order 1)) s
 
 --------------------------------------------------------------------------------
 -- Ground Truth
 
-unmarked :: String -> [Token]
+unmarked :: String -> [Token String]
 unmarked = map (tokenizeChar . toLower) . filter isLetter . filter isAscii
 
-groundTruth :: String -> [Token]
+groundTruth :: String -> [Token String]
 groundTruth =
   map Token . words . map toLower . filter ((||) <$> isLetter <*> isSpace) . filter isAscii
 
 -- Since we're comparing sets, the direction of the scan doesn't actually matter
 -- Therefore, indices are counted from the end of the list to the front
-boundaryIndices :: [Token] -> Set.Set Int
+boundaryIndices :: [Token [a]] -> Set.Set Int
 boundaryIndices ts =
   Set.fromDistinctDescList $
-    (tail . scanr1 (+) . map (\(Token t) -> genericLength t)) ts
+    (tail . scanr1 (+) . map (\(Token t) -> (fromIntegral . length) t)) ts
 
-quality :: [Token] -> [Token] -> Score
+quality :: [Token [a]] -> [Token [a]] -> Score
 quality source target = Score (p, r, f)
   where
     correct = Set.size $ boundaryIndices source `Set.intersection` boundaryIndices target

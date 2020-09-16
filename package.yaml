@@ -28,6 +28,7 @@ dependencies:
 - hashable
 - scientific
 - containers
+- ilist
 
 library:
   source-dirs: src
