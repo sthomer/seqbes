@@ -16,7 +16,7 @@ import Data.Hashable (Hashable)
 import Data.List (inits, intercalate, permutations, nub, sort, sortOn, tails, (\\))
 import Data.List.Index (deleteAt)
 import Data.Maybe (fromMaybe)
-import Data.Ratio (denominator, numerator, (%))
+import Data.Ratio (denominator, numerator, (%), Ratio)
 import qualified Data.Set as Set
 import Numeric (showFFloat)
 
@@ -33,11 +33,19 @@ import Numeric (showFFloat)
 
 newtype Affix = Affix [Int] deriving (Show)
 
--- TODO: Remove record syntax
 data EntropyExpr
   = Term {to :: Int, from :: [Int]}
   | Sum {scale :: Rational, positive :: [EntropyExpr], negative :: [EntropyExpr]}
   deriving (Eq)
+
+data EntropyTerm = EntropyTerm Int [Int]
+
+data EntropySum = EntropySum (Ratio Int, [EntropyTerm]) (Ratio Int, [EntropyTerm])
+
+data EntropyExpr'
+  = Term' Int [Int]
+  | Sum' (Rational, [EntropyExpr']) (Rational, [EntropyExpr'])
+
 
 -- General Maps
 
@@ -235,17 +243,59 @@ instance Show EntropyExpr where
       ++ concatMap ((" - " ++) . show) negative
       ++ " ]"
 
+instance Show EntropyTerm where
+  show (EntropyTerm y []) = "H(" ++ show y ++ ")"
+  show (EntropyTerm y xs) =
+    "H(" ++ show y ++ "|" ++ intercalate "," (map show xs) ++ ")"
+
+instance Show EntropySum where
+  show (EntropySum p n) = showPair p ++ " -\n" ++ showPair n
+    where
+      showPair (_, []) = ""
+      showPair (1, xs) = showSum xs
+      showPair (sx, xs) = showScale sx ++ showSum xs
+      showScale sx = "(" ++ show (numerator sx) ++ "/" ++ show (denominator sx) ++ ")"
+      showSum xs = "[ " ++ intercalate " + " (map show xs) ++ " ]"
+
 --------------------------------------------------------------------------------
 -- Construction
 
 toAffix :: EntropyExpr -> Affix
 toAffix Term {to, from} = Affix $ map (\x -> x - to) from
 
+-- Currently hard-coded to first-order
+toFirstOrderSum :: EntropyTerm -> EntropySum
+toFirstOrderSum (EntropyTerm y []) = EntropySum (1, [EntropyTerm y []]) (1, [])
+toFirstOrderSum (EntropyTerm y [x]) = EntropySum (1, [EntropyTerm y [x]]) (1, [])
+toFirstOrderSum (EntropyTerm y xs) = EntropySum (sp, ps) (sn, ns)
+  where
+    ps = map (\x -> EntropyTerm y [x]) xs
+    ns = map (\(x, x') -> EntropyTerm x [x']) pairs
+    pairs = [(x, y) | x <- xs, y <- xs, x /= y]
+    n = (fromIntegral . length) xs
+    sp = 2 % ((n + 1) * n)
+    sn = 2 % ((n + 1) * n * (n - 1))
+
+toEntropySum :: Order -> EntropyTerm -> EntropySum
+toEntropySum (Order k) (EntropyTerm y xs)
+  | length xs <= k = EntropySum (1, [EntropyTerm y xs]) (1, [])
+  | otherwise = EntropySum (sp, ps) (sn, ns)
+  where
+    ks = subsets k xs
+    ps = map (EntropyTerm y) ks
+    ns = [EntropyTerm x k | x <- xs, k <- ks, x `notElem` k]
+    n = length xs
+    sp = product [1..max 1 (n-k)] % product [(k+2)..(n+1)]
+    sn = product [1..max 1 (n-k-1)] % product [(k+2)..(n+1)]
+
+subsets :: (Ord a) => Int -> [a] -> [[a]]
+subsets k = Set.toList . Set.map Set.toList . Set.filter (\x -> k == length x) . Set.powerSet . Set.fromList
+
 mkH :: Int -> [Int] -> EntropyExpr
 mkH to from = Term {to, from}
 
 decompose :: EntropyExpr -> EntropyExpr
-decompose base@Term {from = [_]} = base -- hardcoded to stop at first-order
+decompose base@Term {from = [_,_,_]} = base -- hardcoded to stop at first-order
 decompose Term {to = y, from = xs} =
   Sum {scale, positive = map decompose pos, negative = map decompose neg}
   where
@@ -278,8 +328,6 @@ cancellation Sum {..} = Sum {scale, positive = ps, negative = ns}
     ns = negative \\ positive
 
 -- TODO: sum terms
-
--- TODO: higher-order direct to first-order
 
 tokenize :: (Monoid a) => Segment a -> Token a
 tokenize (Segment ts) = foldr1 (<>) ts
