@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: b5f5509e60297066c1eff745534faabb5750d374b4a90787032249b208ee395f
+-- hash: 885904b926bd1d5e35fbf6341521aaf8c8c4b397ae141c831ceff0f690d28335
 
 name:           seqbes
 version:        0.1.0.0
@@ -27,12 +27,7 @@ source-repository head
 
 library
   exposed-modules:
-      Context
-      ContextMap
-      Entropy
-      Evaluation
       Lib
-      Segmentation
       Warehouse
   other-modules:
       Paths_seqbes

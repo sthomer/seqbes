@@ -169,3 +169,18 @@ module Warehouse where
 --    n = (fromIntegral . length) xs
 --    sp = 2 % ((n + 1) * n)
 --    sn = 2 % ((n + 1) * n * (n - 1))
+
+--standardMap :: (Eq a, Hashable a) => EntropyMap a -> FrequencyMap a -> EntropyMap a
+--standardMap (EntropyMap' em) (FrequencyMap' fm) = EntropyMap' m'
+--  where
+--    m' = M.map standardize em
+--    fme = M.map (\(Probability x) -> Entropy x) fm -- there's gotta be a better way
+--    mean = sum $ M.elems $ M.unionWith (*) em fme
+--    sd = sqrt $ sum $ M.elems $ M.unionWith (*) fme (M.map (\e -> (e - mean) ^ 2) em)
+--    standardize e = (e - mean) / sd
+
+--frequencies :: (Eq a, Hashable a) => Order -> [Token a] -> Frequencies a
+--frequencies order tokens = M.map (/ total) counts
+--  where
+--    counts = (M.fromListWith (+) . map ((,1) . toContext)) (windows order tokens)
+--    total = (fromIntegral . length) tokens
