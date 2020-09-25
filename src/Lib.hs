@@ -8,10 +8,9 @@ module Lib where
 import Data.Char (isAscii, isLetter, isSpace, toLower)
 import qualified Data.HashMap.Lazy as M
 import Data.Hashable (Hashable)
-import Data.List (elemIndex, inits, intercalate, intersect, nub, sort, sortOn, tails, union, (\\))
-import Data.List.Index (deleteAt)
+import Data.List (elem, elemIndex, inits, intercalate, intersect, nub, sort, sortOn, tails, union, (\\), delete, nubBy, replicate)
 import Data.Maybe (fromJust, fromMaybe)
-import Data.Ratio (Rational, denominator, numerator, (%))
+import Data.Ratio (denominator, numerator, (%))
 import qualified Data.Set as Set
 import Numeric (showFFloat)
 
@@ -48,7 +47,8 @@ type Transitions a = ContextTokenMap a Transition
 newtype Entropy = Entropy Double
   deriving (Num, Eq, Ord, Real, Show, Fractional, Floating, RealFrac, RealFloat)
 
-newtype EntropyTerm = EntropyTerm (Int, [Int]) deriving (Eq, Hashable)
+-- TODO: Record syntax
+newtype EntropyTerm = EntropyTerm (Rational, Int, [Int]) deriving (Eq, Hashable)
 
 data EntropySum = EntropySum (Rational, [EntropyTerm]) (Rational, [EntropyTerm])
 
@@ -99,9 +99,15 @@ instance Show Order where
   show (Order k) = show k
 
 instance Show EntropyTerm where
-  show (EntropyTerm (y, [])) = "H(" ++ show y ++ ")"
-  show (EntropyTerm (y, xs)) =
+  show (EntropyTerm (s, y, [])) = showScale s ++ "H(" ++ show y ++ ")"
+  show (EntropyTerm (s, y, xs)) = showScale s ++
     "H(" ++ show y ++ "|" ++ intercalate "," (map show xs) ++ ")"
+
+showScale :: Rational -> String
+showScale s
+  | s == 1 = ""
+  | numerator s /= 1 && denominator s == 1 = show (numerator s)
+  | otherwise = "(" ++ show (numerator s) ++ "/" ++ show (denominator s) ++ ")"
 
 instance Show EntropySum where
   show (EntropySum p n) = showPair p ++ " -\n" ++ showPair n
@@ -109,7 +115,6 @@ instance Show EntropySum where
       showPair (_, []) = ""
       showPair (1, xs) = showSum xs
       showPair (sx, xs) = showScale sx ++ showSum xs
-      showScale sx = "(" ++ show (numerator sx) ++ "/" ++ show (denominator sx) ++ ")"
       showSum xs = "[ " ++ intercalate " + " (map show xs) ++ " ]"
 
 instance (Show a) => Show (Window a) where
@@ -149,13 +154,13 @@ instance (Show a, Monoid a, Show b) => Show (ShowContextTokenMap a b) where
 -- Utilities
 
 toEntropySum :: Order -> EntropyTerm -> EntropySum
-toEntropySum (Order k) (EntropyTerm (y, xs))
-  | length xs <= k = EntropySum (1, [EntropyTerm (y, xs)]) (1, [])
-  | otherwise = EntropySum (toRational sp, ps) (toRational sn, ns)
+toEntropySum (Order k) (EntropyTerm (s, y, xs))
+  | length xs <= k = EntropySum (1, [EntropyTerm (s, y, xs)]) (1, [])
+  | otherwise = EntropySum (s * toRational sp, ps) (s * toRational sn, ns)
   where
-    ks = subsets k xs
-    ps = map (\k -> EntropyTerm (y, k)) ks
-    ns = [EntropyTerm (x, k) | x <- xs, k <- ks, x `notElem` k]
+    xks = subsets k xs
+    ps = map (\xk -> EntropyTerm (s, y, xk)) xks
+    ns = [EntropyTerm (s, x', xk) | x' <- xs, xk <- xks, x' `notElem` xk]
     n = length xs
     sp = product [1 .. max 1 (n - k)] % product [(k + 2) .. (n + 1)]
     sn = product [1 .. max 1 (n - k -1)] % product [(k + 2) .. (n + 1)]
@@ -163,6 +168,54 @@ toEntropySum (Order k) (EntropyTerm (y, xs))
 subsets :: (Ord a) => Int -> [a] -> [[a]]
 subsets k =
   Set.toList . Set.map Set.toList . Set.filter ((== k) . length) . Set.powerSet . Set.fromList
+
+shorten :: EntropySum -> EntropySum
+shorten (EntropySum (sp, ps) (sn, ns)) = EntropySum (sn, ps'') (sn, ns'')
+  where
+    ratio = sp / sn
+    inflate (EntropyTerm (s, y, xs)) = EntropyTerm (ratio * s, y, xs)
+    spread (EntropyTerm (s, y, xs)) = replicate ((fromIntegral . numerator) s) (mkH y xs)
+    ps' = concatMap (spread . inflate . shortenTerm) ps
+    ns' = concatMap (spread . shortenTerm) ns
+    ps'' = combineTerms $ ps' \\ ns'
+    ns'' = combineTerms ns' \\ ps'
+
+shortenTerm :: EntropyTerm -> EntropyTerm
+shortenTerm (EntropyTerm (s, y, [x]))
+  | y < x = EntropyTerm (s, y, [y + 1])
+  | y > x = EntropyTerm (s, y, [y - 1])
+
+-- Assume equal scales
+-- TODO: Don't assume equal scales
+-- TODO: Ensure numerator is integral when replicating for spread
+minus :: EntropySum -> EntropySum -> EntropySum
+minus (EntropySum (xsp, xps) (xsn, xns)) (EntropySum (_, yps) (_, yns))
+  = EntropySum (xsn, zps3') (xsn, zns3')
+  where
+    ratio = xsp / xsn
+    inflate (EntropyTerm (s, y, xs)) = EntropyTerm (ratio * s, y, xs)
+    spread (EntropyTerm (s, y, xs)) = replicate ((fromIntegral . numerator) s) (mkH y xs)
+    zps = map inflate xps ++ yns
+    zns = xns ++ map inflate yps
+    zps' = concatMap spread zps
+    zns' = concatMap spread zns
+    zps'' = zps' \\ zns'
+    zns'' = zns' \\ zps'
+    zps3' = combineTerms zps''
+    zns3' = combineTerms zns''
+
+combineTerms :: [EntropyTerm] -> [EntropyTerm]
+combineTerms xs = cs
+  where
+    groups = nub $ map (\x -> filter (\y -> to x == to y && from x == from y) xs) xs
+    cs = map (\(g:gs) -> EntropyTerm (foldr ((+) . scale) 0 (g : gs), to g, from g)) groups
+
+combine :: EntropyTerm -> EntropyTerm -> EntropyTerm
+combine (EntropyTerm (sx, xto, xfrom)) (EntropyTerm (sy, yto, yfrom))
+  | sx /= sy = error "Unequal scales"
+  | xto `elem` yfrom = mkH yto (xfrom `union` yfrom)
+  | yto `elem` xfrom = mkH xto (xfrom `union` yfrom)
+  | otherwise = error "Currently unrepresentable"
 
 affixOrder :: Affix -> Order
 affixOrder (Affix axs) = Order $ maximum (0 : axs) - minimum (0 : axs)
@@ -180,7 +233,7 @@ backward :: Order -> Affix
 backward (Order k) = Affix [k]
 
 toAffix :: EntropyTerm -> Affix
-toAffix (EntropyTerm (to, from)) = Affix $ map (\x -> x - to) from
+toAffix (EntropyTerm (_, to, from)) = Affix $ map (\x -> x - to) from
 
 toAffixes :: EntropySum -> [Affix]
 toAffixes (EntropySum (_, ps) (_, ns)) = map toAffix ps ++ map toAffix ns
@@ -188,11 +241,14 @@ toAffixes (EntropySum (_, ps) (_, ns)) = map toAffix ps ++ map toAffix ns
 termOrder :: EntropyTerm -> Order
 termOrder = affixOrder . toAffix
 
+scale :: EntropyTerm -> Rational
+scale (EntropyTerm (s, _, _)) = s
+
 to :: EntropyTerm -> Int
-to (EntropyTerm (x, _)) = x
+to (EntropyTerm (_, x, _)) = x
 
 from :: EntropyTerm -> [Int]
-from (EntropyTerm (_, xs)) = xs
+from (EntropyTerm (_, _, xs)) = xs
 
 range :: EntropySum -> [Int]
 range (EntropySum (_, ps) (_, ns)) = sort $ nub $ concatMap from (ps ++ ns)
@@ -266,9 +322,22 @@ entropiesWith affix = entropies . probabilities . transitionsWith affix
 frequenciesWith :: (Eq a, Hashable a) => Affix -> [Token a] -> Frequencies a
 frequenciesWith affix = frequencies . transitionsWith affix
 
-differences :: (Eq a, Hashable a) => EntropyTerm -> EntropyTerm -> [Token a] -> Entropies a
-differences termA termB tokens = diff
+suffixDiff :: (Eq a, Hashable a) => EntropyTerm -> [Token a] -> Entropies a
+suffixDiff term tokens = diffs
   where
+    entropies = M.toList $ entropiesWith (toAffix term) tokens
+    diffs = M.fromList [
+      (Context (head ca : cb), va - vb) |
+      (Context ca, va) <- entropies,
+      (Context cb, vb) <- entropies,
+      tail ca == init cb]
+
+-- TODO: Break this up; It's slow...
+differences :: (Eq a, Hashable a) => EntropyTerm -> EntropyTerm -> [Token a] -> Entropies a
+differences termA termB tokens = diffs
+  where
+    aEntropies = M.toList $ entropiesWith (toAffix termA) tokens
+    bEntropies = M.toList $ entropiesWith (toAffix termB) tokens
     as = from termA
     bs = from termB
     termIntersection = sort $ as `intersect` bs
@@ -277,10 +346,10 @@ differences termA termB tokens = diff
     pick x ca cb
       | x `elem` as = tokenAt x ca as
       | otherwise = tokenAt x cb bs
-    diff = M.fromList [
+    diffs = M.fromList [
       (Context [pick x ca cb | x <- termUnion], va - vb) |
-      (Context ca, va) <- M.toList $ entropiesWith (toAffix termA) tokens,
-      (Context cb, vb) <- M.toList $ entropiesWith (toAffix termB) tokens,
+      (Context ca, va) <- aEntropies,
+      (Context cb, vb) <- bEntropies,
       all (\x -> tokenAt x ca as == tokenAt x cb bs) termIntersection]
 
 mkAt :: (Eq a, Hashable a) => EntropySum -> [Token a] -> Context a -> Entropy
@@ -295,14 +364,23 @@ mkAt (EntropySum (sp, ps) (sn, ns)) tokens = at
         posTotal = termsTotal posEntropies posContexts ps
         negTotal = termsTotal negEntropies negContexts ns
 
-termsTotal :: (Eq a, Hashable a) => M.HashMap Affix (Entropies a) -> M.HashMap EntropyTerm (Context a) -> [EntropyTerm] -> Entropy
+termsTotal :: (Eq a, Hashable a)
+  => M.HashMap Affix (Entropies a)
+  -> M.HashMap EntropyTerm (Context a)
+  -> [EntropyTerm]
+  -> Entropy
 termsTotal entropyTerms contextTerms terms =
-  sum [M.lookupDefault (Entropy 0) (contextAt term) (entropyAt term) | term <- terms]
+  sum [ Entropy (fromRational (scale term)) * anEntropy term | term <- terms]
   where
     entropyAt term = entropyTerms M.! toAffix term
     contextAt term = contextTerms M.! term
+--    anEntropy term = M.lookupDefault (Entropy 0) (contextAt term) (entropyAt term)
+    anEntropy term = entropyAt term M.! contextAt term
 
-termEntropies :: (Eq a, Hashable a) => [EntropyTerm] -> [Token a] -> M.HashMap Affix (Entropies a)
+termEntropies :: (Eq a, Hashable a)
+  => [EntropyTerm]
+  -> [Token a]
+  -> M.HashMap Affix (Entropies a)
 termEntropies terms ts = M.fromList [(affix, entropiesWith affix ts) | affix <- affixes]
   where
     affixes = nub $ map toAffix terms
@@ -315,7 +393,7 @@ toContext :: EntropyTerm -> Context a -> Context a
 toContext term (Context c) = Context $ [c !! (i -1) | i <- from term]
 
 mkH :: Int -> [Int] -> EntropyTerm
-mkH to from = EntropyTerm (to, sort from)
+mkH to from = EntropyTerm (1, to, sort from)
 
 --------------------------------------------------------------------------------
 -- Segmentation
@@ -512,16 +590,44 @@ expectation contextMap frequencies = sum $ M.elems weightedMap
     fs = M.map unProbability frequencies
     cs = M.map realToFrac contextMap
 
-rmse :: (Eq a, Hashable a, Real b) => ContextMap a b -> ContextMap a b -> Frequencies a -> Double
+rmse :: (Eq a, Hashable a, Real b)
+  => ContextMap a b
+  -> ContextMap a b
+  -> Frequencies a
+  -> Double
 rmse xm ym = sqrt . expectation (M.map (^ 2) (M.intersectionWith (-) xm ym))
 
-mae :: (Eq a, Hashable a, Real b) => ContextMap a b -> ContextMap a b -> Frequencies a -> Double
+mae :: (Eq a, Hashable a, Real b)
+  => ContextMap a b
+  -> ContextMap a b
+  -> Frequencies a
+  -> Double
 mae xm ym = expectation (M.map abs (M.intersectionWith (-) xm ym))
 
-msd :: (Eq a, Hashable a, Real b) => ContextMap a b -> ContextMap a b -> Frequencies a -> Double
+msd :: (Eq a, Hashable a, Real b)
+  => ContextMap a b
+  -> ContextMap a b
+  -> Frequencies a
+  -> Double
 msd xm ym = expectation (M.intersectionWith (-) xm ym)
 
-compareOrder :: (Eq a, Hashable a, Ord b) => ContextMap a b -> ContextMap a b -> Double
+sign :: (Eq a, Hashable a, Real b)
+  => ContextMap a b
+  -> ContextMap a b
+  -> Frequencies a
+  -> Double
+sign xm ym = expectation (M.intersectionWith f xm ym)
+  where
+    f x y
+      | x > 0 && y > 0 = 0
+      | x < 0 && y < 0 = 0
+      | x == 0 && y == 0 = 0
+      | otherwise = 1
+
+compareOrder :: (Eq a, Hashable a, Ord b)
+  => ContextMap a b
+  -> ContextMap a b
+  -> Double
 compareOrder xm ym = totalMatching / totalPairs
   where
     pairs = [(x, y) | x <- M.keys xm, y <- M.keys xm, xm M.! x < xm M.! y]
@@ -529,7 +635,9 @@ compareOrder xm ym = totalMatching / totalPairs
     totalPairs = (fromIntegral . length) pairs
     totalMatching = (fromIntegral . length) matching
 
+-- Only use suffix entropies (for now)
 -- Crossover b/w Decomp and Markov at about 4-context or 5-context
+-- Shortened model almost always nearly as good as full decomposed model
 homm :: FileName -> EntropyTerm -> Order -> IO ()
 homm (FileName filename) term order = do
   text <- readFile filename
@@ -539,9 +647,14 @@ homm (FileName filename) term order = do
       hoFrequencies = frequenciesWith (toAffix term) contents
       -- Decomposed Model
       loTerm = toEntropySum order term
-      at = mkAt loTerm contents
-      loEntropies = M.mapWithKey (\context _ -> at context) hoEntropies
-      rmsError = rmse hoEntropies loEntropies hoFrequencies
+      atLo = mkAt loTerm contents
+      loEntropies = M.mapWithKey (\context _ -> atLo context) hoEntropies
+      rmsErrorLo = rmse hoEntropies loEntropies hoFrequencies
+      -- Shortened Model
+      soTerm = shorten loTerm
+      atSo = mkAt soTerm contents
+      soEntropies = M.mapWithKey (\context _ -> atSo context) hoEntropies
+      rmsErrorSo = rmse hoEntropies soEntropies hoFrequencies
       -- Markov Assumption Model
       moTerm = mkH (to term) [to term - 1] -- only makes sense for suffix entropy
       moEntropies = entropiesWith (toAffix moTerm) contents
@@ -551,15 +664,34 @@ homm (FileName filename) term order = do
             | (Context c, _) <- M.toList hoEntropies
           ]
       rmsError' = rmse hoEntropies moEntropies' hoFrequencies
-  putStrLn $ "Decomp: " ++ showFFloat (Just 3) rmsError ""
   putStrLn $ "Markov: " ++ showFFloat (Just 3) rmsError' ""
+  putStrLn $ "Decomp: " ++ showFFloat (Just 3) rmsErrorLo ""
+  putStrLn $ "Short1: " ++ showFFloat (Just 3) rmsErrorSo ""
 
--- TODO: Evaluate entropy difference
---diff :: FileName -> EntropyTerm -> EntropyTerm -> Order -> IO ()
---diff (FileName filename) termA termB order = do
---  text <- readFile filename
---  let contents = unmarked text
---      hoDiff = differences termA termB contents
-
--- TODO: Reduction of entropy decomposition using Markov assumption
---  i.e. shorten dependency length to 1
+-- Only use suffix entropies (for now)
+suffixDiffs :: FileName -> Order -> Order -> IO ()
+suffixDiffs (FileName filename) (Order higher) order = do
+  text <- readFile filename
+  let contents = unmarked text
+      term = mkH (higher + 2) [2..higher + 1]
+      term' = mkH (higher + 1) [1..higher]
+      -- Higher-order model differences
+      hoDiff = suffixDiff term contents
+      hoFrequencies = frequenciesWith (toAffix (combine term term')) contents
+      -- Decomposed model differences
+      loTerm = toEntropySum order term `minus` toEntropySum order term'
+      at = mkAt loTerm contents
+      loDiff = M.mapWithKey (\context _ -> at context) hoDiff
+      rmsError = rmse hoDiff loDiff hoFrequencies
+      signError = sign hoDiff loDiff hoFrequencies
+      -- Markov assumption model differences
+      markovTerm = mkH 3 [2]
+      moDiff = suffixDiff markovTerm contents
+      moDiff' = M.fromList [ (Context c, moDiff M.! Context ((\(b:a:_) -> [a,b]) (reverse c)))
+                            | (Context c, _) <- M.toList hoDiff]
+      rmsError' = rmse hoDiff moDiff' hoFrequencies
+      signError' = sign hoDiff moDiff' hoFrequencies
+  putStrLn $ "Markov RMSE: " ++ showFFloat (Just 3) rmsError' ""
+  putStrLn $ "Markov Sign: " ++ showFFloat (Just 3) signError' ""
+  putStrLn $ "Decomp RMSE: " ++ showFFloat (Just 3) rmsError ""
+  putStrLn $ "Decomp Sign: " ++ showFFloat (Just 3) signError ""
