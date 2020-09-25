@@ -327,7 +327,7 @@ suffixDiff term tokens = diffs
   where
     entropies = M.toList $ entropiesWith (toAffix term) tokens
     diffs = M.fromList [
-      (Context (head ca : cb), va - vb) |
+      (Context (head ca : cb), vb - va) |
       (Context ca, va) <- entropies,
       (Context cb, vb) <- entropies,
       tail ca == init cb]
