@@ -322,6 +322,8 @@ entropiesWith affix = entropies . probabilities . transitionsWith affix
 frequenciesWith :: (Eq a, Hashable a) => Affix -> [Token a] -> Frequencies a
 frequenciesWith affix = frequencies . transitionsWith affix
 
+-- TODO: Only evaluate the differences actually present in the stream
+--  instead of evaluating all pairs of overlapping contexts
 suffixDiff :: (Eq a, Hashable a) => EntropyTerm -> [Token a] -> Entropies a
 suffixDiff term tokens = diffs
   where
@@ -635,45 +637,52 @@ compareOrder xm ym = totalMatching / totalPairs
     totalPairs = (fromIntegral . length) pairs
     totalMatching = (fromIntegral . length) matching
 
+homms :: FileName -> IO ()
+homms (FileName filename) = do
+  text <- readFile filename
+  putStrLn $ unlines $ do
+    n <- [2..5]
+    k <- [1]
+    return $ show n ++ "\t" ++ show k ++ "\t" ++
+      suffixDiffs (unmarked text) (Order n) (Order k)
+
 -- Only use suffix entropies (for now)
 -- Crossover b/w Decomp and Markov at about 4-context or 5-context
 -- Shortened model almost always nearly as good as full decomposed model
-homm :: FileName -> EntropyTerm -> Order -> IO ()
-homm (FileName filename) term order = do
-  text <- readFile filename
-  let contents = unmarked text
-      -- Higher-order Model
-      hoEntropies = entropiesWith (toAffix term) contents
-      hoFrequencies = frequenciesWith (toAffix term) contents
+homm :: (Eq a, Hashable a) => [Token a] -> EntropyTerm -> Order -> String
+homm ts term order@(Order k) =
+  let hoEntropies = entropiesWith (toAffix term) ts
+      hoFrequencies = frequenciesWith (toAffix term) ts
       -- Decomposed Model
       loTerm = toEntropySum order term
-      atLo = mkAt loTerm contents
+      atLo = mkAt loTerm ts
       loEntropies = M.mapWithKey (\context _ -> atLo context) hoEntropies
       rmsErrorLo = rmse hoEntropies loEntropies hoFrequencies
-      -- Shortened Model
-      soTerm = shorten loTerm
-      atSo = mkAt soTerm contents
-      soEntropies = M.mapWithKey (\context _ -> atSo context) hoEntropies
-      rmsErrorSo = rmse hoEntropies soEntropies hoFrequencies
+      -- Shortened Model (only works when k=1)
+--      soTerm = shorten loTerm
+--      atSo = mkAt soTerm ts
+--      soEntropies = M.mapWithKey (\context _ -> atSo context) hoEntropies
+--      rmsErrorSo = rmse hoEntropies soEntropies hoFrequencies
       -- Markov Assumption Model
-      moTerm = mkH (to term) [to term - 1] -- only makes sense for suffix entropy
-      moEntropies = entropiesWith (toAffix moTerm) contents
+      moTerm = mkH (to term) [to term - k..to term - 1] -- only makes sense for suffix entropy
+      moEntropies = entropiesWith (toAffix moTerm) ts
       moEntropies' =
         M.fromList
-          [ (Context c, moEntropies M.! Context [last c])
+          [ (Context c, moEntropies M.! Context (reverse (take k (reverse c))))
             | (Context c, _) <- M.toList hoEntropies
           ]
-      rmsError' = rmse hoEntropies moEntropies' hoFrequencies
-  putStrLn $ "Markov: " ++ showFFloat (Just 3) rmsError' ""
-  putStrLn $ "Decomp: " ++ showFFloat (Just 3) rmsErrorLo ""
-  putStrLn $ "Short1: " ++ showFFloat (Just 3) rmsErrorSo ""
+      rmsErrorMo = rmse hoEntropies moEntropies' hoFrequencies
+  in  showFFloat (Just 3) rmsErrorMo ""
+      ++ "\t" ++ showFFloat (Just 3) rmsErrorLo ""
+--      ++ "\t" ++ showFFloat (Just 3) rmsErrorSo ""
+--  putStrLn $ "Markov: " ++ showFFloat (Just 3) rmsError' ""
+--  putStrLn $ "Decomp: " ++ showFFloat (Just 3) rmsErrorLo ""
+--  putStrLn $ "Short1: " ++ showFFloat (Just 3) rmsErrorSo ""
 
 -- Only use suffix entropies (for now)
-suffixDiffs :: FileName -> Order -> Order -> IO ()
-suffixDiffs (FileName filename) (Order higher) order = do
-  text <- readFile filename
-  let contents = unmarked text
-      term = mkH (higher + 2) [2..higher + 1]
+suffixDiffs :: (Eq a, Hashable a) => [Token a] -> Order -> Order -> String
+suffixDiffs contents (Order higher) order =
+  let term = mkH (higher + 2) [2..higher + 1]
       term' = mkH (higher + 1) [1..higher]
       -- Higher-order model differences
       hoDiff = suffixDiff term contents
@@ -682,16 +691,22 @@ suffixDiffs (FileName filename) (Order higher) order = do
       loTerm = toEntropySum order term `minus` toEntropySum order term'
       at = mkAt loTerm contents
       loDiff = M.mapWithKey (\context _ -> at context) hoDiff
-      rmsError = rmse hoDiff loDiff hoFrequencies
-      signError = sign hoDiff loDiff hoFrequencies
-      -- Markov assumption model differences
+      rmsErrorLo = rmse hoDiff loDiff hoFrequencies
+      signErrorLo = sign hoDiff loDiff hoFrequencies
+      -- Shortened Model (only works when k=1)
+      soTerm = shorten loTerm
+      atSo = mkAt soTerm contents
+      soEntropies = M.mapWithKey (\context _ -> atSo context) hoDiff
+      rmsErrorSo = rmse hoDiff soEntropies hoFrequencies
+      signErrorSo = sign hoDiff loDiff hoFrequencies
+      -- Markov Assumption Model
       markovTerm = mkH 3 [2]
       moDiff = suffixDiff markovTerm contents
       moDiff' = M.fromList [ (Context c, moDiff M.! Context ((\(b:a:_) -> [a,b]) (reverse c)))
                             | (Context c, _) <- M.toList hoDiff]
-      rmsError' = rmse hoDiff moDiff' hoFrequencies
-      signError' = sign hoDiff moDiff' hoFrequencies
-  putStrLn $ "Markov RMSE: " ++ showFFloat (Just 3) rmsError' ""
-  putStrLn $ "Markov Sign: " ++ showFFloat (Just 3) signError' ""
-  putStrLn $ "Decomp RMSE: " ++ showFFloat (Just 3) rmsError ""
-  putStrLn $ "Decomp Sign: " ++ showFFloat (Just 3) signError ""
+      rmsErrorMo = rmse hoDiff moDiff' hoFrequencies
+      signErrorMo = sign hoDiff moDiff' hoFrequencies
+  in  showFFloat (Just 3) rmsErrorMo "" ++ "\t" ++ showFFloat (Just 3) signErrorMo "" ++ "\t" ++
+      showFFloat (Just 3) rmsErrorLo "" ++ "\t" ++ showFFloat (Just 3) signErrorLo "" ++ "\t" ++
+      showFFloat (Just 3) rmsErrorSo "" ++ "\t" ++ showFFloat (Just 3) signErrorSo ""
+
