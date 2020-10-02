@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 885904b926bd1d5e35fbf6341521aaf8c8c4b397ae141c831ceff0f690d28335
+-- hash: b680045d70824fc1f31ae295f0ab916bc30ea0321d3d87fb75a3b1e013601f1b
 
 name:           seqbes
 version:        0.1.0.0
@@ -27,6 +27,7 @@ source-repository head
 
 library
   exposed-modules:
+      Graph
       Lib
       Warehouse
   other-modules:
@@ -37,11 +38,11 @@ library
       HUnit
     , QuickCheck
     , base >=4.7 && <5
+    , bytestring
+    , bytestring-trie
     , containers
     , hashable
     , hspec
-    , ilist
-    , scientific
     , unordered-containers
   default-language: Haskell2010
 
@@ -56,11 +57,11 @@ executable seqbes-exe
       HUnit
     , QuickCheck
     , base >=4.7 && <5
+    , bytestring
+    , bytestring-trie
     , containers
     , hashable
     , hspec
-    , ilist
-    , scientific
     , seqbes
     , unordered-containers
   default-language: Haskell2010
@@ -77,11 +78,11 @@ test-suite seqbes-test
       HUnit
     , QuickCheck
     , base >=4.7 && <5
+    , bytestring
+    , bytestring-trie
     , containers
     , hashable
     , hspec
-    , ilist
-    , scientific
     , seqbes
     , unordered-containers
   default-language: Haskell2010

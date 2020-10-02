@@ -1,4 +1,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE TupleSections #-}
 
 module Lib where
 
@@ -6,12 +9,15 @@ module Lib where
 -- Imports
 
 import Data.Char (isAscii, isLetter, isSpace, toLower)
-import qualified Data.HashMap.Lazy as M
+import qualified Data.HashMap.Strict as M
 import Data.Hashable (Hashable)
-import Data.List (elem, elemIndex, inits, intercalate, intersect, nub, sort, sortOn, tails, union, (\\), delete, nubBy, replicate)
+import Data.List (elemIndex, inits, intercalate, intersect, nub, sort, sortOn, tails, union, (\\))
 import Data.Maybe (fromJust, fromMaybe)
 import Data.Ratio (denominator, numerator, (%))
-import qualified Data.Set as Set
+import qualified Data.Set as S
+import qualified Data.ByteString.Char8 as C
+--import qualified Data.Trie as T
+--import qualified Data.Trie.Convenience as T (fromListWith)
 import Numeric (showFFloat)
 
 --------------------------------------------------------------------------------
@@ -25,6 +31,8 @@ newtype Order = Order Int deriving (Num)
 
 newtype Affix = Affix {unAffix :: [Int]}
   deriving (Show, Eq, Hashable) -- e.g. H(B|ACDE) = [-1,+1,+2,+3]
+
+--type ContextTrie a = T.Trie a
 
 type ContextMap a b = M.HashMap (Context a) b
 
@@ -73,6 +81,13 @@ newtype Segment a = Segment [Token a]
 newtype Frame a = Frame (Token a, (Context a, Context a), (Context a, Context a))
 
 newtype Depth = Depth Int
+
+
+--------------------------------------------------------------------------------
+-- Context Graph
+
+subseq :: Int -> String -> [String]
+subseq n = filter (not . null) . filter ((<= n) . length) . concatMap inits . tails
 
 --------------------------------------------------------------------------------
 -- Instances
@@ -165,9 +180,22 @@ toEntropySum (Order k) (EntropyTerm (s, y, xs))
     sp = product [1 .. max 1 (n - k)] % product [(k + 2) .. (n + 1)]
     sn = product [1 .. max 1 (n - k -1)] % product [(k + 2) .. (n + 1)]
 
+-- Assume EntropyTerm is a suffix entropy with no scale
+toSegBias :: EntropyTerm -> (EntropySum, EntropySum)
+toSegBias (EntropyTerm (_, y, xs)) = (seg, bias)
+  where
+    n = length xs
+    s' = toRational $ 2 % product [n - 1 .. n + 1]
+    segpos = [EntropyTerm (toRational (i - 1), y, [xs !! (i-1)]) | i <- [2..n]]
+    segneg = [EntropyTerm (1, xs !! (j-1), [xs !! (i-1)]) | j <- [2..n], i <- [1..j-1]]
+    biaspos = [EntropyTerm (toRational (n - i), y, [xs !! (i-1)]) | i <- [1..n-1]]
+    biasneg = [EntropyTerm (1, xs !! (i-1), [xs !! (j-1)]) | j <- [2..n], i <- [1..j-1]]
+    seg = EntropySum (s', segpos) (s', segneg)
+    bias = EntropySum (s', biaspos) (s', biasneg)
+
 subsets :: (Ord a) => Int -> [a] -> [[a]]
 subsets k =
-  Set.toList . Set.map Set.toList . Set.filter ((== k) . length) . Set.powerSet . Set.fromList
+  S.toList . S.map S.toList . S.filter ((== k) . length) . S.powerSet . S.fromList
 
 shorten :: EntropySum -> EntropySum
 shorten (EntropySum (sp, ps) (sn, ns)) = EntropySum (sn, ps'') (sn, ns'')
@@ -269,6 +297,15 @@ toWindow (Context c) = Window c
 
 --------------------------------------------------------------------------------
 -- Construction
+
+--mkCT :: Order -> String -> ContextTrie (Int, Integer)
+--mkCT (Order n) = T.fromListWith (\(l, x) (_, y) -> (l, x + y)) . map (\x -> (C.pack x, (length x, 1))) . filter ((<= n) . length) . subseq n
+
+--subseq :: Int -> String -> [String]
+--subseq n = filter (not . null) . filter ((<= n) . length) . concatMap inits . tails
+
+--branch :: C.ByteString -> ContextTrie (Int, Integer) -> ContextTrie (Int, Integer)
+--branch x = T.filterMap (\(l, y) -> if l == 1 + C.length x then Just (l, y) else Nothing) . T.submap x
 
 increment :: (Eq a, Hashable a) => (Token a, Context a) -> Transitions a -> Transitions a
 increment (token, context) = M.insertWith (M.unionWith (+)) context (M.singleton token 1)
@@ -558,15 +595,15 @@ groundTruth =
 
 -- Since we're comparing sets, the direction of the scan doesn't actually matter
 -- Therefore, indices are counted from the end of the list to the front
-boundaryIndices :: [Token [a]] -> Set.Set Int
+boundaryIndices :: [Token [a]] -> S.Set Int
 boundaryIndices ts =
-  Set.fromDistinctDescList $
+  S.fromDistinctDescList $
     (tail . scanr1 (+) . map (\(Token t) -> (fromIntegral . length) t)) ts
 
 quality :: [Token [a]] -> [Token [a]] -> Score
 quality source target = Score (p, r, f)
   where
-    correct = Set.size $ boundaryIndices source `Set.intersection` boundaryIndices target
+    correct = S.size $ boundaryIndices source `S.intersection` boundaryIndices target
     found = length target - 1
     total = length source - 1
     p =
@@ -591,6 +628,25 @@ expectation contextMap frequencies = sum $ M.elems weightedMap
     weightedMap = M.intersectionWith (*) fs cs
     fs = M.map unProbability frequencies
     cs = M.map realToFrac contextMap
+
+variance :: (Eq a, Hashable a, Real b, Fractional b) => ContextMap a b -> Frequencies a -> Double
+variance contextMap = covariance contextMap contextMap
+
+covariance :: (Eq a, Hashable a, Real b, Fractional b) => ContextMap a b -> ContextMap a b -> Frequencies a -> Double
+covariance cmA cmB frequencies = expectation diffs frequencies
+  where
+    meanA =  realToFrac $ expectation cmA frequencies
+    meanB = realToFrac $ expectation cmB frequencies
+    diffA = M.map (\v -> v - meanA) cmA
+    diffB = M.map (\v -> v - meanB) cmB
+    diffs = M.intersectionWith (*) diffA diffB
+
+correlation :: (Eq a, Hashable a, Real b, Fractional b) => ContextMap a b -> ContextMap a b -> Frequencies a -> Double
+correlation cmA cmB frequencies = cov / (stdA * stdB)
+  where
+    cov = covariance cmA cmB frequencies
+    stdA = sqrt $ variance cmA frequencies
+    stdB = sqrt $ variance cmB frequencies
 
 rmse :: (Eq a, Hashable a, Real b)
   => ContextMap a b
@@ -640,11 +696,12 @@ compareOrder xm ym = totalMatching / totalPairs
 homms :: FileName -> IO ()
 homms (FileName filename) = do
   text <- readFile filename
+  putStrLn $ intercalate "\t" ["Src-n", "Tgt-k", "RMSE-M", "RMSE-D", "Corr-M", "Corr-D"]
   putStrLn $ unlines $ do
-    n <- [2..5]
-    k <- [1]
+    n <- [7]
+    k <- [1..n-1]
     return $ show n ++ "\t" ++ show k ++ "\t" ++
-      suffixDiffs (unmarked text) (Order n) (Order k)
+      homm (unmarked text) (mkH (n+1) [1..n]) (Order k)
 
 -- Only use suffix entropies (for now)
 -- Crossover b/w Decomp and Markov at about 4-context or 5-context
@@ -658,6 +715,7 @@ homm ts term order@(Order k) =
       atLo = mkAt loTerm ts
       loEntropies = M.mapWithKey (\context _ -> atLo context) hoEntropies
       rmsErrorLo = rmse hoEntropies loEntropies hoFrequencies
+      corrLo = correlation hoEntropies loEntropies hoFrequencies
       -- Shortened Model (only works when k=1)
 --      soTerm = shorten loTerm
 --      atSo = mkAt soTerm ts
@@ -672,8 +730,11 @@ homm ts term order@(Order k) =
             | (Context c, _) <- M.toList hoEntropies
           ]
       rmsErrorMo = rmse hoEntropies moEntropies' hoFrequencies
-  in  showFFloat (Just 3) rmsErrorMo ""
-      ++ "\t" ++ showFFloat (Just 3) rmsErrorLo ""
+      corrMo = correlation hoEntropies moEntropies' hoFrequencies
+  in  showFFloat (Just 3) rmsErrorMo "\t"
+      ++ showFFloat (Just 3) rmsErrorLo "\t"
+      ++ showFFloat (Just 3) corrMo "\t"
+      ++ showFFloat (Just 3) corrLo "\t"
 --      ++ "\t" ++ showFFloat (Just 3) rmsErrorSo ""
 --  putStrLn $ "Markov: " ++ showFFloat (Just 3) rmsError' ""
 --  putStrLn $ "Decomp: " ++ showFFloat (Just 3) rmsErrorLo ""
@@ -710,3 +771,138 @@ suffixDiffs contents (Order higher) order =
       showFFloat (Just 3) rmsErrorLo "" ++ "\t" ++ showFFloat (Just 3) signErrorLo "" ++ "\t" ++
       showFFloat (Just 3) rmsErrorSo "" ++ "\t" ++ showFFloat (Just 3) signErrorSo ""
 
+segEval :: FileName -> IO ()
+segEval (FileName filename) = do
+  text <- readFile filename
+  let contents = unmarked text
+--      -- H(C|B) - H(B|A)
+--      dHaTerm = EntropySum (1, [mkH 3 [2]]) (1, [mkH 2 [1]])
+--      -- H(C|A) - H(A|B)
+--      dHbTerm = EntropySum (1, [mkH 3 [1]]) (1, [mkH 1 [2]])
+--      -- H(C|B) + H(C|A) - H(B|A) - H(A|B)
+--      dH'Term = EntropySum (1, [mkH 3 [2], mkH 3 [1]]) (1, [mkH 2 [1], mkH 1 [2]])
+--      H(C|AB)
+--      fs = frequenciesWith (Affix [-2,-1]) contents
+--      -- H(C|B) + H(B|C) - H(B|A) - H(C|D)
+--      dHaTerm = EntropySum (1, [mkH 3 [2], mkH 2 [3]]) (1, [mkH 2 [1], mkH 3 [4]])
+--      -- H(C|A) + H(B|D) - H(A|B) - H(D|C)
+--      dHbTerm = EntropySum (1, [mkH 3 [1], mkH 2 [4]]) (1, [mkH 1 [2], mkH 4 [3]])
+--      -- H(C|B) + H(B|C) + H(C|A) + H(B|D) - H(B|A) - H(C|D) - H(A|B) - H(D|C)
+--      dH'Term = EntropySum (1, [mkH 3 [2], mkH 2 [3], mkH 3 [1], mkH 2 [4]]) (1, [mkH 2 [1], mkH 3 [4], mkH 1 [2], mkH 4 [3]])
+--      -- H(C|AB) + H(B|CD)
+--      fs = frequenciesWith (Affix [-4,-3,-2,-1]) contents
+--      -- H*(D|ABC) -> 1
+--      dHaTerm = EntropySum (1, [mkH 4 [3], mkH 4 [3], mkH 4 [2]]) (1, [mkH 2 [1], mkH 3 [2], mkH 3 [1]])
+--      dHbTerm = EntropySum (1, [mkH 4 [1], mkH 4 [1], mkH 4 [2]]) (1, [mkH 1 [2], mkH 2 [3], mkH 1 [3]])
+--      dH'Term = EntropySum (1, [mkH 4 [3], mkH 4 [3], mkH 4 [2], mkH 4 [1], mkH 4 [1], mkH 4 [2]]) (1, [mkH 2 [1], mkH 3 [2], mkH 3 [1], mkH 1 [2], mkH 2 [3], mkH 1 [3]])
+--      fs = frequenciesWith (Affix [1,2,3]) contents
+      -- H'(D|ABC)
+--      dHaTerm = EntropySum (1, [mkH 4 [3], mkH 4 [2], mkH 1 [2], mkH 2 [1]]) (1, [mkH 2 [3], mkH 3 [2], mkH 3 [1], mkH 3 [2]])
+--      dHbTerm = EntropySum (1, [mkH 4 [1], mkH 4 [1], mkH 4 [2], mkH 4 [3], mkH 3 [2]]) (1, [mkH 1 [2], mkH 1 [2], mkH 2 [1], mkH 2 [1], mkH 1 [3]])
+--      dH'Term = EntropySum (1, [mkH 4 [3], mkH 4 [3], mkH 4 [2], mkH 4 [2], mkH 4 [1], mkH 4 [1]]) (1, [mkH 2 [1], mkH 1 [2], mkH 3 [1], mkH 1 [3], mkH 2 [3], mkH 3 [2]])
+--      fs = frequenciesWith (Affix [1,2,3]) contents
+--      -- H^(D|ABC)
+--      dHaTerm = EntropySum (1, [mkH 4 [3], mkH 2 [1]]) (1, [mkH 3 [2], mkH 3 [2]])
+--      dHbTerm = EntropySum (1, [mkH 4 [1], mkH 4 [1], mkH 4 [2], mkH 4 [2], mkH 4 [3], mkH 3 [2]]) (1, [mkH 2 [1], mkH 2 [1], mkH 1 [2], mkH 1 [3], mkH 3 [1], mkH 2 [3]])
+--      dH'Term = EntropySum (1, [mkH 4 [3], mkH 4 [3], mkH 4 [2], mkH 4 [2], mkH 4 [1], mkH 4 [1]]) (1, [mkH 2 [1], mkH 1 [2], mkH 3 [1], mkH 1 [3], mkH 2 [3], mkH 3 [2]])
+--      fs = frequenciesWith (Affix [1,2,3]) contents
+--      -- H*(D|ABC) -> 2
+--      dHaTerm = EntropySum (1, [mkH 4 [2,3]]) (1, [mkH 3 [1,2]])
+--      dHbTerm = EntropySum (1, [mkH 4 [1,2], mkH 4 [1,3]]) (1, [mkH 1 [2,3], mkH 2 [1,3]])
+--      dH'Term = EntropySum (1, [mkH 4 [2,3], mkH 4 [1,2], mkH 4 [1,3]]) (1, [mkH 3 [1,2], mkH 1 [2,3], mkH 2 [1,3]])
+--      fs = frequenciesWith (Affix [1,2,3]) contents
+      -- H(E|ABCD) -> 1
+--      dHaTerm = EntropySum (1, [mkH 5 [2], mkH 5 [3], mkH 5 [3], mkH 5 [4], mkH 5 [4], mkH 5 [4]]) (1, [mkH 4 [1], mkH 3 [1], mkH 4 [2], mkH 2 [1], mkH 3 [2], mkH 4 [3]])
+--      dHbTerm = EntropySum (1, [mkH 5 [1], mkH 5 [1], mkH 5 [1], mkH 5 [2], mkH 5 [2], mkH 5 [3]]) (1, [mkH 1 [2], mkH 1 [3], mkH 1 [4], mkH 2 [3], mkH 2 [4], mkH 3 [4]])
+--      dH'Term = EntropySum (1, [mkH 5 [2], mkH 5 [3], mkH 5 [3], mkH 5 [4], mkH 5 [4], mkH 5 [4], mkH 5 [1], mkH 5 [1], mkH 5 [1], mkH 5 [2], mkH 5 [2], mkH 5 [3]]) (1, [mkH 4 [1], mkH 3 [1], mkH 4 [2], mkH 2 [1], mkH 3 [2], mkH 4 [3], mkH 1 [2], mkH 1 [3], mkH 1 [4], mkH 2 [3], mkH 2 [4], mkH 3 [4]])
+--      fs = frequenciesWith (Affix [1,2,3,4]) contents
+      term = mkH 10 [1..9]
+      (dHaTerm, dHbTerm) = toSegBias term
+      dH'Term = toEntropySum (Order 1) term
+      fs = frequenciesWith (toAffix term) contents
+      atA = mkAt dHaTerm contents
+      atB = mkAt dHbTerm contents
+      at' = mkAt dH'Term contents
+      entA = M.mapWithKey (\context _ -> atA context) fs
+      entB = M.mapWithKey (\context _ -> atB context) fs
+      ent' = M.mapWithKey (\context _ -> at' context) fs
+      rmseAB = rmse entA entB fs
+      rmseA' = rmse entA ent' fs
+      rmseB' = rmse entB ent' fs
+      msdAB = msd entA entB fs
+      msdA' = msd entA ent' fs
+      msdB' = msd entB ent' fs
+      expA = expectation entA fs
+      expB = expectation entB fs
+      exp' = expectation ent' fs
+      varA = variance entA fs
+      varB = variance entB fs
+      var' = variance ent' fs
+      covAB = covariance entA entB fs
+      covA' = covariance entA ent' fs
+      covB' = covariance entB ent' fs
+      corrAB = correlation entA entB fs
+      corrA' = correlation entA ent' fs
+      corrB' = correlation entB ent' fs
+  putStrLn $ "Pair\tSquared Diff\tSigned Diff\tCovariance\tCorrelation"
+  putStrLn $ "A,B\t"
+    ++ showFFloat (Just 6) rmseAB "\t"
+    ++ showFFloat (Just 6) msdAB "\t"
+    ++ showFFloat (Just 6) covAB "\t"
+    ++ showFFloat (Just 6) corrAB "\t"
+  putStrLn $ "A,A+B\t"
+    ++ showFFloat (Just 6) rmseA' "\t"
+    ++ showFFloat (Just 6) msdA' "\t"
+    ++ showFFloat (Just 6) covA' "\t"
+    ++ showFFloat (Just 6) corrA' "\t"
+  putStrLn $ "B,A+B\t"
+    ++ showFFloat (Just 6) rmseB' "\t"
+    ++ showFFloat (Just 6) msdB' "\t"
+    ++ showFFloat (Just 6) covB' "\t"
+    ++ showFFloat (Just 6) corrB' "\t"
+  putStrLn $ "Term\tExpectation\tVariance"
+  putStrLn $ "A\t"
+    ++ showFFloat (Just 6) expA "\t"
+    ++ showFFloat (Just 6) varA "\t"
+  putStrLn $ "B\t"
+    ++ showFFloat (Just 6) expB "\t"
+    ++ showFFloat (Just 6) varB "\t"
+  putStrLn $ "A+B\t"
+    ++ showFFloat (Just 6) exp' "\t"
+    ++ showFFloat (Just 6) var' "\t"
+
+segBiasEval :: FileName -> IO ()
+segBiasEval (FileName filename) = do
+  text <- readFile filename
+  putStrLn $ intercalate "\t"
+    ["Order",
+    "Diff-ST", "Corr-BT", "Diff-BT", "Corr-BT",
+    "Corr-SH", "Corr-BH", "Corr-TH"]
+  putStrLn $ unlines $ do
+    n <- [2..10]
+    let contents = unmarked text
+        term = mkH (n+1) [1..n]
+        (seg, bias) = toSegBias term
+        total = toEntropySum (Order 1) term
+        fs = frequenciesWith (toAffix term) contents
+        atSeg = mkAt seg contents
+        atBias = mkAt bias contents
+        atTotal = mkAt total contents
+        entSeg = M.mapWithKey (\context _ -> atSeg context) fs
+        entBias = M.mapWithKey (\context _ -> atBias context) fs
+        entTotal = M.mapWithKey (\context _ -> atTotal context) fs
+        entHigh = entropiesWith (toAffix term) contents
+        varSeg = variance entSeg fs
+        varBias = variance entBias fs
+        varTotal = variance entTotal fs
+        diffSegTotal = abs (varSeg - varTotal) / varTotal
+        diffBiasTotal = abs (varBias - varTotal) / varTotal
+        corrSegTotal = correlation entSeg entTotal fs
+        corrBiasTotal = correlation entBias entTotal fs
+        corrSegHigh = correlation entSeg entHigh fs
+        corrBiasHigh = correlation entBias entHigh fs
+        corrTotalHigh = correlation entTotal entHigh fs
+    return $ show n ++ "\t" ++ concatMap (\v -> showFFloat (Just 3) v "\t") [
+      diffSegTotal, corrSegTotal, diffBiasTotal, corrBiasTotal,
+      corrSegHigh, corrBiasHigh, corrTotalHigh
+      ]

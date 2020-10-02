@@ -26,9 +26,9 @@ dependencies:
 - HUnit
 - hspec
 - hashable
-- scientific
 - containers
-- ilist
+- bytestring
+- bytestring-trie
 
 library:
   source-dirs: src
