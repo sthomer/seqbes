@@ -28,7 +28,8 @@ dependencies:
 - hashable
 - containers
 - bytestring
-- bytestring-trie
+#- bytestring-trie
+- random
 
 library:
   source-dirs: src
