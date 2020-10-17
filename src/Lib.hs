@@ -6,34 +6,38 @@
 module Lib where
 
 --------------------------------------------------------------------------------
+-- Corpora:
+--   https://wortschatz.uni-leipzig.de/en/download/
+
+--------------------------------------------------------------------------------
 -- Imports
 
 import Data.Char (isAscii, isLetter, isSpace, toLower)
 import qualified Data.HashMap.Strict as M
 import Data.Hashable (Hashable)
-import Data.List (elemIndex, inits, intercalate, intersect, nub, sort, sortOn, tails, union, (\\), foldl')
+import Data.List (elemIndex, inits, intercalate, intersect, nub, sort, sortOn, tails, union, (\\), foldl', transpose, unzip4)
 import Data.Maybe (fromJust, fromMaybe)
 import Data.Ratio (denominator, numerator, (%))
 import qualified Data.Set as S
-import qualified Data.ByteString.Char8 as C
---import qualified Data.Trie as T
---import qualified Data.Trie.Convenience as T (fromListWith)
 import Numeric (showFFloat)
 import System.Random
+import Data.List.Index (deleteAt)
 
 --------------------------------------------------------------------------------
 -- Types
 
+newtype FileName = FileName String
+
+-- General Context Models
+
 newtype Token a = Token a deriving (Eq, Hashable)
 
-newtype Context a = Context [Token a] deriving (Eq, Hashable)
+newtype Context a = Context {unContext :: [Token a]} deriving (Eq, Hashable)
 
 newtype Order = Order Int deriving (Num)
 
 newtype Affix = Affix {unAffix :: [Int]}
   deriving (Show, Eq, Hashable) -- e.g. H(B|ACDE) = [-1,+1,+2,+3]
-
---type ContextTrie a = T.Trie a
 
 type ContextMap a b = M.HashMap (Context a) b
 
@@ -43,33 +47,30 @@ type ContextTokenMap a b = ContextMap a (M.HashMap (Token a) b)
 
 newtype ShowContextTokenMap a b = ShowContextTokenMap (ContextTokenMap a b)
 
-type Entropies a = ContextMap a Entropy
+-- Specific Context Models
 
-type InfoContents a = ContextTokenMap a Entropy
+newtype Window a = Window [Token a]
+
+newtype Transition = Transition {unTransition :: Int}
+  deriving (Num, Eq, Ord, Real, Show)
+
+type Transitions a = ContextTokenMap a Transition
+
+newtype Probability = Probability {unProbability :: Double}
+  deriving (Num, Eq, Ord, Real, Fractional, RealFrac, Floating, RealFloat)
 
 type Frequencies a = ContextMap a Probability
 
 type Probabilities a = ContextTokenMap a Probability
 
-type Transitions a = ContextTokenMap a Transition
-
 newtype Entropy = Entropy Double
   deriving (Num, Eq, Ord, Real, Fractional, Floating, RealFrac, RealFloat)
 
--- TODO: Record syntax
-newtype EntropyTerm = EntropyTerm (Rational, Int, [Int]) deriving (Eq, Hashable)
+type Entropies a = ContextMap a Entropy
 
-data EntropySum = EntropySum (Rational, [EntropyTerm]) (Rational, [EntropyTerm])
+type InfoContents a = ContextTokenMap a Entropy
 
-newtype Window a = Window [Token a]
-
-newtype Probability = Probability {unProbability :: Double}
-  deriving (Num, Eq, Ord, Real, Fractional, RealFrac, Floating, RealFloat)
-
-newtype Transition = Transition {unTransition :: Int}
-  deriving (Num, Eq, Ord, Real, Show)
-
-newtype FileName = FileName String
+-- Segmentation
 
 newtype Score = Score (Double, Double, Double)
 
@@ -83,12 +84,17 @@ newtype Frame a = Frame (Token a, (Context a, Context a), (Context a, Context a)
 
 newtype Depth = Depth Int
 
+-- Linear Combination Entropy
 
---------------------------------------------------------------------------------
--- Context Graph
+-- 1-based index
+newtype EntropyTerm = EntropyTerm (Rational, Int, [Int]) deriving (Eq, Hashable)
 
-subseq :: Int -> String -> [String]
-subseq n = filter (not . null) . filter ((<= n) . length) . concatMap inits . tails
+data EntropySum = EntropySum (Rational, [EntropyTerm]) (Rational, [EntropyTerm])
+
+-- Joint Distribution
+
+-- Requires finite alphabet and finite context length
+type Joint a = ContextMap a Probability
 
 --------------------------------------------------------------------------------
 -- Instances
@@ -125,12 +131,6 @@ instance Show EntropyTerm where
   show (EntropyTerm (s, y, xs)) = showScale s ++
     "H(" ++ show y ++ "|" ++ intercalate "," (map show xs) ++ ")"
 
-showScale :: Rational -> String
-showScale s
-  | s == 1 = ""
-  | numerator s /= 1 && denominator s == 1 = show (numerator s)
-  | otherwise = "(" ++ show (numerator s) ++ "/" ++ show (denominator s) ++ ")"
-
 instance Show EntropySum where
   show (EntropySum p n) = showPair p ++ " -\n" ++ showPair n
     where
@@ -163,7 +163,7 @@ instance (Show a, Monoid a, RealFloat b) => Show (ShowContextMap a b) where
   show (ShowContextMap m) = intercalate "\n" s
     where
       s = map showEntry $ sortOn snd (M.toList m)
-      showEntry (t, n) = show t ++ ": " ++ showFFloat (Just 3) n ""
+      showEntry (t, n) = show t ++ ": " ++ showFFloat (Just 5) n ""
 
 instance (Show a, Monoid a, Show b) => Show (ShowContextTokenMap a b) where
   show (ShowContextTokenMap m) = intercalate "\n" $ map showContexts (M.toList m)
@@ -173,7 +173,7 @@ instance (Show a, Monoid a, Show b) => Show (ShowContextTokenMap a b) where
       showEntry (t, n) = "  " ++ show t ++ ": " ++ show n
 
 --------------------------------------------------------------------------------
--- Utilities
+-- Linear Combination Entropy
 
 toEntropySum :: Order -> EntropyTerm -> EntropySum
 toEntropySum (Order k) (EntropyTerm (s, y, xs))
@@ -302,25 +302,177 @@ entropy = sum . map weight
 toWindow :: Context a -> Window a
 toWindow (Context c) = Window c
 
+showScale :: Rational -> String
+showScale s
+  | s == 1 = ""
+  | numerator s /= 1 && denominator s == 1 = show (numerator s)
+  | otherwise = "(" ++ show (numerator s) ++ "/" ++ show (denominator s) ++ ")"
+
+p2e :: Probability -> Entropy
+p2e (Probability p) = Entropy p
+
+states :: Int -> Int -> [Context String]
+states n k = map Context cs
+  where
+    xs = map (Token . (: [])) (take n ['a'..'z'])
+    repeatFor k' = concat . replicate (n^(k-k'-1)) . concatMap (replicate (n^k'))
+    cs = transpose [ repeatFor k' xs | k' <- [0..k-1]]
+
+mkJoint :: Int -> Int -> Int -> Joint String
+mkJoint seed n k = M.fromList $ zip contexts probs
+  where
+    contexts = states n k
+    weights = take (length contexts) $ randoms (mkStdGen seed)
+    weights' = map (**(1/1000)) weights
+--    weights' = replicate (length contexts) (1 / (fromIntegral n^k))
+    total = sum weights'
+    probs = map (Probability . (/ total)) weights'
+
+-- TODO: make sure margin index is within list range
+marginal :: (Eq a, Hashable a) => Int -> Joint a -> Joint a
+marginal n joint = M.fromListWith (+) $ map removeAt $ M.toList joint
+  where
+    removeAt (Context k, v) = (Context $ deleteAt (n-1) k, v)
+
+marginals :: (Eq a, Hashable a) => [Int] -> Joint a -> Joint a
+marginals [] joint = joint
+marginals (n:ns) joint = marginals (map pred ns) (marginal n joint)
+
+conditional :: (Eq a, Hashable a) => Int -> [Int] -> Joint a -> Joint a
+conditional y xs joint = M.fromList divs
+  where
+    js = [1..(length . unContext . fst . head . M.toList) joint]
+    top = marginals (sort $ js \\ (y:xs)) joint
+    bottom = marginals (sort $ js \\ xs) joint
+    y' = length $ filter (< y) xs
+    divs = [(Context ka, va / vb) |
+            (Context ka, va) <- M.toList top,
+            (Context kb, vb) <- M.toList bottom,
+            kb == deleteAt y' ka]
+
+checkTriangles :: FileName -> IO ()
+checkTriangles (FileName output) = do
+  writeFile output $ intercalate ","
+    ["alphabet", "seed", "error"] ++ "\n"
+  appendFile output $ unlines $ do
+    n <- [2..20]
+    seed <- [1..100]
+    let err = checkTriangle seed n
+    return $ intercalate "," $
+      map show [n, seed] ++ map show [err]
+
+checkTriangle :: Int -> Int -> Double
+checkTriangle seed alphabet = mae left right joint
+  where
+    joint = mkJoint seed alphabet 3
+    hAC = termFromJoint (mkH 1 [3]) joint
+    hBA = termFromJoint (mkH 2 [1]) joint
+    hCB = termFromJoint (mkH 3 [2]) joint
+    hCA = termFromJoint (mkH 3 [1]) joint
+    hAB = termFromJoint (mkH 1 [2]) joint
+    hBC = termFromJoint (mkH 2 [3]) joint
+    left = M.fromList [( Context [a,b,c],
+      hBA M.! Context [a] + hCB M.! Context [b] + hAC M.! Context [c])
+      | Context [a, b, c] <- M.keys joint]
+    right = M.fromList [(Context [a,b,c],
+      hCA M.! Context [a] + hAB M.! Context [b] + hBC M.! Context [c])
+      | Context [a, b, c] <- M.keys joint]
+
+termFromJoint :: (Eq a, Hashable a) => EntropyTerm -> Joint a -> Entropies a
+termFromJoint (EntropyTerm (s, y, xs)) = sEntropies . conditional y xs
+  where
+    y' = length $ filter (< y) xs
+    removeAt (Context k, v) = (Context $ deleteAt y' k, v)
+    sEntropy p = fromRational s * p2e p * infoContent p
+    sEntropies = M.fromListWith (+) . map removeAt . M.toList . M.map sEntropy
+
+sumFromJoint :: (Eq a, Hashable a) => EntropySum -> Joint a -> Entropies a
+sumFromJoint (EntropySum (sp, ps) (sn, ns)) joint = total
+  where
+    rangeXs = (nub . concatMap (\(EntropyTerm (_, _, xs)) -> xs)) (ps ++ ns)
+    toEntropies = M.fromList . map (\term -> (term, termFromJoint term joint))
+    translate (Context cs) (EntropyTerm (_, _, xs)) = Context [cs !! (x - 1) | x <- xs]
+    totalEntropy context entropies terms = sum $ map (\term -> (entropies M.! term) M.! translate context term) terms
+    posEntropies = toEntropies ps
+    negEntropies = toEntropies ns
+    total = M.fromList $ do
+      Context xs <- M.keys joint
+      let
+        context = Context [xs !! (x - 1) | x <- rangeXs]
+        posTotal = totalEntropy context posEntropies ps
+        posScaled = Entropy (fromRational sp) * posTotal
+        negTotal = totalEntropy context negEntropies ns
+        negScaled = Entropy (fromRational sn) * negTotal
+      return (context, posScaled - negScaled)
+
+suffixJoints :: FileName -> IO ()
+suffixJoints (FileName output) = do
+  writeFile output $ intercalate ","
+    ["alphabet", "order", "seed", "decomp", "markov", "seg", "bias"] ++ "\n"
+  appendFile output $ unlines $ do
+    n <- [2..5]
+    k <- [3..5]
+    seed <- [1..100]
+    let (decomp, markov, seg, bias) = suffixJoint seed n k
+    return $ intercalate "," $
+      map show [n, k, seed] ++ map show [decomp, markov, seg, bias]
+
+meanSuffixJoint :: Int -> Int -> Int -> (Double, Double)
+meanSuffixJoint m n k = (meanDecomp, meanMarkov)
+  where
+    (decomp, markov, seg, bias) = unzip4 [suffixJoint seed n k | seed <- [1..m]]
+    meanDecomp = sum decomp / fromIntegral m
+    meanMarkov = sum markov / fromIntegral m
+
+suffixJoint :: Int -> Int -> Int -> (Double, Double, Double, Double)
+suffixJoint seed n k = (
+    correlation hoEntropies decompEntropies (marginal k joint),
+    correlation hoEntropies markovEntropies (marginal k joint),
+    correlation hoEntropies segEntropies (marginal k joint),
+    correlation hoEntropies biasEntropies (marginal k joint)
+  )
+  where
+    joint = mkJoint seed n k
+    hoTerm = mkH k [1..k-1]
+    decompTerm = toEntropySum (Order 1) hoTerm
+    (seg, bias) = toSegBias hoTerm
+    markovTerm = mkH k [k-1]
+    hoEntropies = termFromJoint hoTerm joint
+    decompEntropies = sumFromJoint decompTerm joint
+    segEntropies = sumFromJoint seg joint
+    biasEntropies = sumFromJoint bias joint
+    markovEntropies' = termFromJoint markovTerm joint
+    markovEntropies = M.fromList [(Context cs, markovEntropies' M.! Context [last cs]) | Context cs <- M.keys hoEntropies]
+
+suffixSum :: Int -> Int -> Int -> Double
+suffixSum seed n k =
+    correlation hoEntropies decompEntropies (marginal (k+1) joint)
+--    correlation hoEntropies markovEntropies (marginal (k+1) joint))
+  where
+    joint = mkJoint seed n (k+1)
+    hoTermP = mkH (k+1) [2..k]
+    hoTermN = mkH k [1..k-1]
+    hoSum = EntropySum (1, [hoTermP]) (1, [hoTermN])
+    decompSum = toEntropySum (Order 1) hoTermP `minus` toEntropySum (Order 1) hoTermN
+--    markovSum = EntropySum (1, [mkH (k+1) [k]]) (1, [mkH k [k-1]])
+    hoEntropies = sumFromJoint hoSum joint
+    decompEntropies = sumFromJoint decompSum joint
+--    markovEntropies' = sumFromJoint markovSum joint
+--    markovEntropies = M.fromList [(Context cs, markovEntropies' M.! Context [last cs]) | Context cs <- M.keys hoEntropies]
+
 --------------------------------------------------------------------------------
 -- Construction
 
---mkCT :: Order -> String -> ContextTrie (Int, Integer)
---mkCT (Order n) = T.fromListWith (\(l, x) (_, y) -> (l, x + y)) . map (\x -> (C.pack x, (length x, 1))) . filter ((<= n) . length) . subseq n
-
---subseq :: Int -> String -> [String]
---subseq n = filter (not . null) . filter ((<= n) . length) . concatMap inits . tails
-
---branch :: C.ByteString -> ContextTrie (Int, Integer) -> ContextTrie (Int, Integer)
---branch x = T.filterMap (\(l, y) -> if l == 1 + C.length x then Just (l, y) else Nothing) . T.submap x
-
+-- TODO: Incrementing by iterating through windows is a bottleneck
 increment :: (Eq a, Hashable a) => (Token a, Context a) -> Transitions a -> Transitions a
 increment (token, context) = M.insertWith (M.unionWith (+)) context (M.singleton token 1)
 
 countTransitions :: (Eq a, Hashable a) => Affix -> [Window a] -> Transitions a
 countTransitions affix =
+  -- use foldl' because HashMap is strict
   foldl' (flip (increment . affixSplit affix)) M.empty
-  -- using foldl' because HashMap is strict...?
+  -- use foldr if HashMap is lazy
+  -- foldlr (increment . affixSplit affix) M.empty
 
 transitions :: (Eq a, Hashable a) => Affix -> Order -> [Token a] -> Transitions a
 transitions affix (Order k) = countTransitions affix . windows (Order (k + 1))
@@ -410,6 +562,17 @@ mkAt (EntropySum (sp, ps) (sn, ns)) tokens = at
         negContexts = termContexts ns context
         posTotal = termsTotal posEntropies posContexts ps
         negTotal = termsTotal negEntropies negContexts ns
+
+termsTotal' :: (Eq a, Hashable a)
+  => M.HashMap EntropyTerm (Entropies a)
+  -> M.HashMap EntropyTerm (Context a)
+  -> [EntropyTerm]
+  -> Entropy
+termsTotal' entropyTerms contextTerms terms = sum [anEntropy term | term <- terms]
+  where
+    entropyAt term = entropyTerms M.! term
+    contextAt term = contextTerms M.! term
+    anEntropy term = entropyAt term M.! contextAt term
 
 termsTotal :: (Eq a, Hashable a)
   => M.HashMap Affix (Entropies a)
@@ -652,7 +815,8 @@ covariance cmA cmB frequencies = expectation diffs frequencies
     diffB = M.map (\v -> v - meanB) cmB
     diffs = M.intersectionWith (*) diffA diffB
 
-correlation :: (Eq a, Hashable a, Real b, Fractional b) => ContextMap a b -> ContextMap a b -> Frequencies a -> Double
+correlation :: (Eq a, Hashable a, Real b, Fractional b) =>
+  ContextMap a b -> ContextMap a b -> Frequencies a -> Double
 correlation cmA cmB frequencies = cov / (stdA * stdB)
   where
     cov = covariance cmA cmB frequencies

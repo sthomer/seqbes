@@ -27,9 +27,8 @@ dependencies:
 - hspec
 - hashable
 - containers
-- bytestring
-#- bytestring-trie
 - random
+- ilist
 
 library:
   source-dirs: src
