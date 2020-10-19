@@ -323,7 +323,7 @@ mkJoint seed n k = M.fromList $ zip contexts probs
   where
     contexts = states n k
     weights = take (length contexts) $ randoms (mkStdGen seed)
-    weights' = map (**(1/1000)) weights
+    weights' = map (1/) weights
 --    weights' = replicate (length contexts) (1 / (fromIntegral n^k))
     total = sum weights'
     probs = map (Probability . (/ total)) weights'
@@ -349,6 +349,118 @@ conditional y xs joint = M.fromList divs
             (Context ka, va) <- M.toList top,
             (Context kb, vb) <- M.toList bottom,
             kb == deleteAt y' ka]
+
+condLimits :: FileName -> IO ()
+condLimits (FileName output) = do
+  writeFile output $ intercalate ","
+    ["alphabet", "seed", "low", "mid", "high"] ++ "\n"
+  appendFile output $ unlines $ do
+    n <- [2..15]
+    seed <- [1..100]
+    let
+      pABC = mkJoint seed n 3
+      pAB = marginal 3 pABC
+      pAC = marginal 2 pABC
+      pBC = marginal 1 pABC
+      pCgAB = conditional 3 [1,2] pABC
+      pCgA = conditional 3 [1] pABC
+      pCgB = conditional 3 [2] pABC
+      pAgB = conditional 1 [2] pABC
+      pBgA = conditional 2 [1] pABC
+      (Entropy hCgAB) = sum [(Entropy pabc) * infoContent (pCgAB M.! context)
+        | (context, Probability pabc) <- M.toList pABC]
+      (Entropy hCgA) = sum [(Entropy pac) * infoContent (pCgA M.! context)
+        | (context, Probability pac) <- M.toList pAC]
+      (Entropy hCgB) = sum [(Entropy pbc) * infoContent (pCgB M.! context)
+        | (context, Probability pbc) <- M.toList pBC]
+      (Entropy hAgB) = sum [(Entropy pab) * infoContent (pAgB M.! context)
+        | (context, Probability pab) <- M.toList pAB]
+      (Entropy hBgA) = sum [(Entropy pab) * infoContent (pBgA M.! context)
+        | (context, Probability pab) <- M.toList pAB]
+      (Entropy hAB) = entropy $ M.elems pAB
+      total = hCgA + hCgB - hAgB - hBgA
+      low = total / 3
+      high = (total + hAB)/2
+    return $ intercalate "," $
+      map show [n, seed] ++ map show [low, hCgAB, high]
+
+limits :: FileName -> IO ()
+limits (FileName output) = do
+  writeFile output $ intercalate ","
+    ["alphabet", "seed", "low", "mid", "high"] ++ "\n"
+  appendFile output $ unlines $ do
+    n <- [2..15]
+    seed <- [1..100]
+    let
+      pABC = mkJoint seed n 3
+      pAB = marginal 3 pABC
+      pAC = marginal 2 pABC
+      pBC = marginal 1 pABC
+      (Entropy hABC) = entropy $ M.elems pABC
+      (Entropy hAB) = entropy $ M.elems pAB
+      (Entropy hAC) = entropy $ M.elems pAC
+      (Entropy hBC) = entropy $ M.elems pBC
+      total = hAB + hAC + hBC
+    return $ intercalate "," $
+      map show [n, seed] ++ map show [total/3, hABC, total/2]
+
+agreement :: FileName -> IO ()
+agreement (FileName output) = do
+  writeFile output $ intercalate ","
+    ["alphabet", "seed", "agree", "match"] ++ "\n"
+  appendFile output $ unlines $ do
+    n <- [1..30]
+    seed <- [1..100]
+    let
+      pABC = mkJoint seed n 3
+      pAB = marginal 3 pABC
+      pAC = marginal 2 pABC
+      pBC = marginal 1 pABC
+      total = M.fromList [( Context [a,b,c],
+        infoContent (pAB M.! Context [a,b]) + infoContent (pAC M.! Context [a,c]) + infoContent (pBC M.! Context [b, c]))
+        | Context [a, b, c] <- M.keys pABC]
+      joint = M.map infoContent pABC
+      lower = M.map (Entropy (1/3) *) total
+      upper = M.map (Entropy (1/2) *) total
+      percent = 1 / (fromIntegral . M.size) pABC
+      agree' = sum [if mid <= high then percent else 0
+        | c <- M.keys pABC,
+          let low = show (lower M.! c),
+          let mid = show (joint M.! c),
+          let high = show (upper M.! c)]
+      agree = sum [if mid <= high then pABC M.! c else 0
+        | c <- M.keys pABC,
+          let low = show (lower M.! c),
+          let mid = show (joint M.! c),
+          let high = show (upper M.! c)]
+    return $ intercalate "," $
+      map show [n, seed] ++ map show [agree, agree']
+
+corrPairs :: FileName -> IO ()
+corrPairs (FileName output) = do
+  writeFile output $ intercalate ","
+    ["alphabet", "seed", "context", "frequency", "low", "mid", "high"] ++ "\n"
+  appendFile output $ unlines $ do
+    n <- [1..10]
+    seed <- [1..100]
+    let
+      pABC = mkJoint seed n 3
+      pAB = marginal 3 pABC
+      pAC = marginal 2 pABC
+      pBC = marginal 1 pABC
+      total = M.fromList [( Context [a,b,c],
+        infoContent (pAB M.! Context [a,b]) + infoContent (pAC M.! Context [a,c]) + infoContent (pBC M.! Context [b, c]))
+        | Context [a, b, c] <- M.keys pABC]
+      joint = M.map infoContent pABC
+      lower = M.map (Entropy (1/3) *) total
+      upper = M.map (Entropy (1/2) *) total
+      es = [lower, joint, upper]
+      rows = [show n : show seed : show c : show (pABC M.! c) :
+        map (show . (M.! c)) es | c <- M.keys pABC]
+    return $ unlines $ map (intercalate ",") rows
+
+ent :: Probability -> Entropy
+ent p = p2e p * infoContent p
 
 checkTriangles :: FileName -> IO ()
 checkTriangles (FileName output) = do
@@ -377,6 +489,14 @@ checkTriangle seed alphabet = mae left right joint
     right = M.fromList [(Context [a,b,c],
       hCA M.! Context [a] + hAB M.! Context [b] + hBC M.! Context [c])
       | Context [a, b, c] <- M.keys joint]
+
+--termFromJoint' :: (Eq a, Hashable a) => Order -> EntropyTerm -> Joint a -> Entropies a
+--termFromJoint' (Order k) (EntropyTerm (s, y, xs)) joint = M.fromList e
+--  where
+--    cond = conditional y xs joint
+--    flat = marginals ([1..k] \\ (y:xs)) joint
+--    e = [ (c, Entropy p * infoContent (cond M.! c))
+--        | (c, Probability p) <- M.toList flat]
 
 termFromJoint :: (Eq a, Hashable a) => EntropyTerm -> Joint a -> Entropies a
 termFromJoint (EntropyTerm (s, y, xs)) = sEntropies . conditional y xs
